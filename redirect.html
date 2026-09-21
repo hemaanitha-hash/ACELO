@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="robots" content="noindex" />
+    <title>Signing in</title>
+    <style>
+      body {
+        margin: 0;
+        display: grid;
+        place-items: center;
+        height: 100vh;
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: #241014;
+        background: #fff;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      MSAL v5 redirect bridge.
+
+      A dedicated Vite entry point, separate from index.html. It loads no React,
+      no router and no ACELO code: its only job is to hand the authentication
+      response MSAL placed in this URL back to the application window.
+
+      broadcastResponseToMainFrame() decides what to do from the signed `state`:
+        - popup    -> posts the payload to the opener and closes this window
+        - redirect -> caches the payload and navigates back to the application,
+                      where handleRedirectPromise() consumes it
+    -->
+    <p>Processing authentication...</p>
+    <script type="module" src="/src/redirect.ts"></script>
+  </body>
+</html>
