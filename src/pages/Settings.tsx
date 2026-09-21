@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   Upload,
 } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
 import { useMsal } from "@azure/msal-react";
 import { InteractionStatus } from "@azure/msal-browser";
 import type { AccountInfo } from "@azure/msal-browser";
@@ -28,12 +29,19 @@ import {
   createEnvironment,
   describeProvisioningError,
   discoverEnvironment,
+  getClusterSettings,
+  getEnvironment,
+  getPersistedDiscovery,
   getProvisioningStatus,
   getReadiness2,
   listEnvironments,
   provisionEnvironment,
+  saveClusterSettings,
   testEnvironment,
   updateEnvironment,
+  type ClusterExecution,
+  type ClusterSettings,
+  type ClusterSettingsState,
   type ConnectionTestResult,
   type DiscoveryResult,
   type Environment,
@@ -41,6 +49,7 @@ import {
   type EnvironmentPlatform,
   type ProvisioningState,
   type Readiness2,
+  type WorkspacePipeline,
 } from "../services/environmentApi";
 
 /**
@@ -52,7 +61,51 @@ import {
  * posted once and never read back.
  */
 
-type Stage = "idle" | "testing" | "discovering" | "provisioning";
+type Stage = "idle" | "testing" | "discovering" | "provisioning" | "saving";
+
+const EMPTY_CLUSTER_SETTINGS: ClusterSettings = {
+  source_table: "",
+  result_table: "",
+  source_lakehouse: "",
+  result_lakehouse: "",
+  lakehouse_database: "",
+  sql_endpoint: "",
+  column_mapping: "",
+  fabric_environment_id: "",
+  execution_type: "",
+  source_schema: "",
+  result_schema: "",
+  pipeline_id: "",
+  lakehouse_id: "",
+  lakehouse_workspace_id: "",
+  approval_tracking_table: "",
+};
+
+/** Package states in which the ACELO notebooks are deployed and usable. */
+const INSTALLED_STATES = ["INSTALLED", "UPDATE_AVAILABLE"];
+
+/** Connection result implied by a persisted environment (after a page reload). */
+function persistedTestResult(env: Environment): ConnectionTestResult | null {
+  if (env.status === "connected" || env.status === "environment_ready" || env.status === "discovery_failed") {
+    return {
+      platform: env.platform,
+      connected: true,
+      workspace_id: env.workspace_id,
+      workspace_name: env.workspace_name,
+      message: "Connection previously verified",
+      last_verified_at: env.last_verified_at,
+    };
+  }
+  if (env.last_error_message) {
+    return {
+      platform: env.platform,
+      connected: false,
+      message: env.last_error_message,
+      error_code: env.last_error_code,
+    };
+  }
+  return null;
+}
 
 const PLATFORM_LABELS: Record<EnvironmentPlatform, string> = {
   fabric: "Microsoft Fabric",
@@ -89,6 +142,7 @@ export default function Settings() {
   // previous version seeded a useState initializer once at mount, so an account
   // that arrived afterwards was never picked up and the UI stayed signed-out.
   const { instance, accounts, inProgress } = useMsal();
+  const navigate = useNavigate();
   const [platform, setPlatform] = useState<EnvironmentPlatform>("fabric");
   const [authMode, setAuthMode] = useState<AuthMode>("service_principal");
   const [signedInAccount, setSignedInAccount] = useState<AccountInfo | null>(null);
@@ -121,6 +175,47 @@ export default function Settings() {
   // Backend-computed readiness. It is the authority on whether Cluster can run.
   const [readiness, setReadiness] = useState<Readiness2 | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [clusterSettings, setClusterSettings] = useState<ClusterSettings>(EMPTY_CLUSTER_SETTINGS);
+  const [clusterMissing, setClusterMissing] = useState<string[]>([]);
+  // What the backend persisted on the last successful save — the confirmation
+  // shows THIS, never the form's local values.
+  const [savedState, setSavedState] = useState<ClusterSettingsState | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // Backend-resolved execution path and the workspace's pipelines.
+  const [clusterExecution, setClusterExecution] = useState<ClusterExecution | null>(null);
+  const [pipelines, setPipelines] = useState<WorkspacePipeline[]>([]);
+
+  /**
+   * Re-reads everything this page shows from the backend. Called on load and
+   * after EVERY operation, so no control can stay disabled because local state
+   * missed an update. Each read is independent: one failing does not blank the
+   * others.
+   */
+  async function refresh(envId: string, opts: { restoreConnection?: boolean } = {}) {
+    const [env, prov, ready, settings] = await Promise.all([
+      getEnvironment(envId).catch(() => null),
+      getProvisioningStatus(envId).catch(() => null),
+      getReadiness2(envId).catch(() => null),
+      getClusterSettings(envId).catch(() => null),
+    ]);
+    if (env) {
+      setEnvironment(env);
+      if (opts.restoreConnection) setTestResult(persistedTestResult(env));
+      // Discovery persisted by the backend survives reloads and later steps.
+      const persisted = await getPersistedDiscovery(env).catch(() => null);
+      if (persisted) setDiscovery(persisted);
+    }
+    if (prov) setProvisioning(prov);
+    if (ready) setReadiness(ready);
+    if (settings) applyClusterState(settings);
+  }
+
+  function applyClusterState(state: ClusterSettingsState) {
+    setClusterSettings(state.settings);
+    setClusterMissing(state.missing);
+    setClusterExecution(state.execution ?? null);
+    setPipelines(state.pipelines ?? []);
+  }
 
   // Restore the persisted environment so a page refresh keeps safe state.
   // Only non-secret fields come back from the API.
@@ -129,35 +224,17 @@ export default function Settings() {
       .then((envs) => {
         const existing = envs.find((e) => e.platform === platform);
         if (!existing) return;
-        setEnvironment(existing);
         if (existing.auth_mode) setAuthMode(existing.auth_mode);
-        void getProvisioningStatus(existing.id).then(setProvisioning).catch(() => {});
-        void getReadiness2(existing.id).then(setReadiness).catch(() => {});
         setForm((f) => ({
           ...f,
           name: existing.name,
           tenantId: existing.tenant_id ?? "",
           workspaceId: existing.workspace_id ?? "",
         }));
-        if (existing.status === "connected" || existing.status === "environment_ready") {
-          setTestResult({
-            platform: existing.platform,
-            connected: true,
-            workspace_id: existing.workspace_id,
-            workspace_name: existing.workspace_name,
-            message: "Connection previously verified",
-            last_verified_at: existing.last_verified_at,
-          });
-        } else if (existing.last_error_message) {
-          setTestResult({
-            platform: existing.platform,
-            connected: false,
-            message: existing.last_error_message,
-            error_code: existing.last_error_code,
-          });
-        }
+        return refresh(existing.id, { restoreConnection: true });
       })
       .catch((e: unknown) => setError(e instanceof ApiError ? e.message : String(e)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform]);
 
   const isFabric = platform === "fabric";
@@ -207,26 +284,47 @@ export default function Settings() {
       setReadiness(null);
     }
   }
-  const canTest = useMemo(() => {
-    if (!form.name.trim()) return false;
+  /**
+   * Why Test Connection is unavailable, or null when it can run. The button
+   * used to be disabled silently (e.g. an empty environment name), which left
+   * users with a dead control and no explanation.
+   */
+  const testBlockedReason = useMemo((): string | null => {
     if (isFabric) {
       if (authMode === "user") {
         // Needs only a signed-in Microsoft account and a workspace ID — never
         // a secret, and never a stale auth snapshot.
-        return Boolean(account && form.workspaceId.trim());
+        if (!isMsalConfigured()) return "Microsoft sign-in is not configured for this deployment.";
+        if (!account) return "Sign in with Microsoft to test the Fabric connection.";
+        if (!form.workspaceId.trim()) return "Enter the Fabric Workspace ID.";
+      } else {
+        const missing = [
+          !form.tenantId.trim() && "Tenant ID",
+          !form.workspaceId.trim() && "Workspace ID",
+          !form.clientId.trim() && "Client ID",
+          !form.clientSecret && !environment && "Client Secret",
+        ].filter(Boolean);
+        if (missing.length) return `Enter ${missing.join(", ")}.`;
       }
-      return Boolean(form.tenantId && form.workspaceId && form.clientId && (form.clientSecret || environment));
+    } else if (platform === "databricks") {
+      if (!form.endpoint.trim()) return "Enter the Databricks workspace URL.";
+      if (!form.clientSecret && !environment) return "Enter the access token.";
+    } else {
+      return "File analysis does not need a connection.";
     }
-    if (platform === "databricks") {
-      return Boolean(form.endpoint && (form.clientSecret || environment));
-    }
-    return false;
+    return null;
   }, [form, isFabric, platform, environment, authMode, account]);
+  const canTest = testBlockedReason === null;
+
+  /** A name is required by the backend; default it rather than block on it. */
+  function environmentName(): string {
+    return form.name.trim() || (isFabric ? "Fabric Production" : "Databricks Production");
+  }
 
   async function persistEnvironment(): Promise<Environment> {
     const userMode = isFabric && authMode === "user";
     const payload = {
-      name: form.name.trim(),
+      name: environmentName(),
       platform,
       auth_mode: isFabric ? authMode : undefined,
       // Personal mode never sends tenant/client/secret — there is no secret to
@@ -260,7 +358,8 @@ export default function Settings() {
       const result = await testEnvironment(env.id, token);
       setTestResult(result);
       // Clear the secret from component state once the backend holds it.
-      if (result.connected) setForm((f) => ({ ...f, clientSecret: "" }));
+      if (result.connected) setForm((f) => ({ ...f, name: env.name, clientSecret: "" }));
+      await refresh(env.id);
     } catch (e: unknown) {
       if (e instanceof FabricAuthError) setError(e.message);
       else setError(e instanceof ApiError ? e.message : "Unexpected error testing the connection.");
@@ -276,6 +375,9 @@ export default function Settings() {
     try {
       const result = await discoverEnvironment(environment.id, await currentFabricToken());
       setDiscovery(result);
+      await refresh(environment.id);
+      // A failed discovery must stay visible even if an older one was persisted.
+      if (!result.discovered) setDiscovery(result);
     } catch (e: unknown) {
       if (e instanceof FabricAuthError) setError(e.message);
       else setError(e instanceof ApiError ? e.message : "Unexpected error during discovery.");
@@ -290,7 +392,7 @@ export default function Settings() {
     setError(null);
     try {
       setProvisioning(await provisionEnvironment(environment.id, await currentFabricToken()));
-      setReadiness(await getReadiness2(environment.id).catch(() => null));
+      await refresh(environment.id);
     } catch (e: unknown) {
       if (e instanceof FabricAuthError) setError(e.message);
       else setError(e instanceof ApiError ? e.message : "Unexpected error setting up ACELO.");
@@ -299,15 +401,54 @@ export default function Settings() {
     }
   }
 
+  async function handleSaveClusterSettings() {
+    if (!environment) return;
+    setStage("saving");
+    setSaveError(null);
+    setSavedState(null);
+    try {
+      const payload = { ...clusterSettings };
+      if (payload.execution_type === "pipeline") {
+        // Persist the pipeline actually shown as selected, not an implicit default.
+        payload.pipeline_id = payload.pipeline_id || defaultPipelineId;
+      } else {
+        // Notebook needs no pipeline; don't persist a stale selection with it.
+        payload.pipeline_id = "";
+      }
+      const saved = await saveClusterSettings(environment.id, payload);
+      applyClusterState(saved);
+      setSavedState(saved);
+      await refresh(environment.id);
+    } catch (e: unknown) {
+      setSaveError(e instanceof ApiError ? e.message : "Unexpected error.");
+    } finally {
+      setStage("idle");
+    }
+  }
+
+  // What the pipeline dropdown shows when no pipeline was explicitly chosen:
+  // the one the backend resolves (ACELO's), so UI and execution agree.
+  const defaultPipelineId =
+    clusterExecution?.pipeline?.id ?? pipelines.find((p) => p.managed)?.id ?? pipelines[0]?.id ?? "";
+
   const connected = testResult?.connected === true;
   const discovered = discovery?.discovered === true;
+  const installed = INSTALLED_STATES.includes(provisioning?.status ?? "");
   // Mirrors the backend rule: connection + discovery are not enough. A verified
   // ACELO package with a ready Cluster notebook is required.
   const readyForAnalysis =
-    connected &&
-    discovered &&
-    provisioning?.status === "INSTALLED" &&
-    Boolean(provisioning?.domains?.cluster?.ready);
+    connected && discovered && installed && Boolean(provisioning?.domains?.cluster?.ready);
+
+  // The actual reason each later step is unavailable — never a dead button.
+  const discoverBlockedReason = !environment || !connected ? "Fabric connection required." : null;
+  const provisionBlockedReason = !connected
+    ? "Fabric connection required."
+    : !discovered
+      ? "Environment discovery required."
+      : provisioning?.deployable === false
+        ? "This ACELO build has no optimization notebooks bundled, so there is nothing to deploy."
+        : null;
+  const settingsBlockedReason = !environment || !connected ? "Fabric connection required." : null;
 
   // Cluster is independent of Query and Storage. The backend is the authority
   // on this; the local expression is only a fallback before readiness loads.
@@ -338,8 +479,16 @@ export default function Settings() {
                 <button
                   key={p}
                   type="button"
+                  aria-pressed={active}
                   onClick={() => {
+                    // Re-clicking the selected card used to wipe the loaded
+                    // environment without reloading it (the restore effect only
+                    // re-runs when the platform changes), disabling every step.
+                    if (p === platform) return;
                     setPlatform(p);
+                    setReadiness(null);
+                    setClusterSettings(EMPTY_CLUSTER_SETTINGS);
+                    setClusterMissing([]);
                     setEnvironment(null);
                     setTestResult(null);
                     setDiscovery(null);
@@ -361,11 +510,18 @@ export default function Settings() {
 
           {platform === "file" ? (
             <div className="mt-6 rounded-md border border-panel-border bg-canvas-raised p-4">
-              <p className="text-sm font-medium text-ink">File analysis is not available yet</p>
+              <p className="text-sm font-medium text-ink">No setup needed for file analysis</p>
               <p className="mt-1 text-sm text-ink-muted">
-                File-based environments are planned for a later phase. Connect Microsoft Fabric or
-                Databricks to continue.
+                Upload a Cluster CSV directly in the AI Agent. It is analysed by the ACELO Cluster
+                optimizer without any platform connection.
               </p>
+              <Link
+                to="/agent"
+                className="mt-3 inline-flex items-center gap-2 rounded-md border border-brand-500 bg-white px-4 py-2 text-sm font-medium text-brand-500 hover:bg-brand-50"
+              >
+                <Upload size={16} />
+                Go to AI Agent
+              </Link>
             </div>
           ) : (
             <>
@@ -538,7 +694,7 @@ export default function Settings() {
                   {stage === "testing" ? "Testing connection..." : "Test Connection"}
                 </button>
 
-                {testResult && !testResult.connected && stage === "idle" && (
+                {testResult && !testResult.connected && stage === "idle" && canTest && (
                   <button
                     type="button"
                     onClick={handleTestConnection}
@@ -549,6 +705,11 @@ export default function Settings() {
                   </button>
                 )}
               </div>
+              {testBlockedReason && (
+                <p data-testid="test-blocked-reason" className="mt-3 text-xs text-ink-muted">
+                  {testBlockedReason}
+                </p>
+              )}
             </>
           )}
         </section>
@@ -629,7 +790,14 @@ export default function Settings() {
 
         {/* ---------------- Discovery ---------------- */}
         <section className="surface p-6">
-          <h2 className="text-lg font-semibold text-ink">Environment Discovery</h2>
+          <h2 className="flex items-center gap-2 text-lg font-semibold text-ink">
+            Environment Discovery
+            {discovered && stage !== "discovering" && (
+              <span data-testid="discovery-complete" className="flex items-center gap-1 text-sm font-medium text-signal-low">
+                <CheckCircle2 size={16} /> Complete
+              </span>
+            )}
+          </h2>
           <p className="mt-1 text-sm text-ink-muted">
             Lists the resources in the connected workspace. This is read-only — nothing is executed.
           </p>
@@ -637,17 +805,15 @@ export default function Settings() {
           <button
             type="button"
             onClick={handleDiscover}
-            disabled={!connected || stage !== "idle"}
+            disabled={discoverBlockedReason !== null || stage !== "idle"}
             className="mt-4 inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-brand-600 disabled:opacity-50"
           >
             {stage === "discovering" && <Loader2 size={16} className="animate-spin" />}
             {stage === "discovering" ? "Discovering environment..." : "Discover Environment"}
           </button>
 
-          {!connected && (
-            <p className="mt-3 text-xs text-ink-muted">
-              Test the connection successfully before discovering the environment.
-            </p>
+          {discoverBlockedReason && (
+            <p className="mt-3 text-xs text-ink-muted">{discoverBlockedReason}</p>
           )}
 
           {discovery && stage === "idle" && (
@@ -721,7 +887,14 @@ export default function Settings() {
           <div className="flex items-start gap-3">
             <Package size={19} className="mt-0.5 text-brand-500" />
             <div>
-              <h2 className="text-lg font-semibold text-ink">ACELO Installation</h2>
+              <h2 className="flex items-center gap-2 text-lg font-semibold text-ink">
+                ACELO Installation
+                {installed && stage !== "provisioning" && (
+                  <span data-testid="install-complete" className="flex items-center gap-1 text-sm font-medium text-signal-low">
+                    <CheckCircle2 size={16} /> Installed
+                  </span>
+                )}
+              </h2>
               <p className="mt-1 text-sm text-ink-muted">
                 Deploys ACELO&apos;s optimization notebooks into your workspace under the{" "}
                 <span className="font-medium text-ink">{provisioning?.namespace ?? "ACELO"}</span>{" "}
@@ -734,7 +907,7 @@ export default function Settings() {
             <span className="text-ink-muted">Status: </span>
             <span
               className={
-                provisioning?.status === "INSTALLED"
+                installed
                   ? "font-medium text-signal-low"
                   : provisioning?.status === "FAILED"
                     ? "font-medium text-signal-high"
@@ -825,11 +998,15 @@ export default function Settings() {
             <button
               type="button"
               onClick={() => void handleProvision()}
-              disabled={!connected || stage !== "idle" || provisioning?.deployable === false}
+              disabled={provisionBlockedReason !== null || stage !== "idle"}
               className="inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-brand-600 disabled:opacity-50"
             >
               {stage === "provisioning" && <Loader2 size={16} className="animate-spin" />}
-              {provisioning?.status === "INSTALLED" ? "Re-run ACELO Setup" : "Set up ACELO in Fabric"}
+              {provisioning?.status === "UPDATE_AVAILABLE"
+                ? "Update ACELO in Fabric"
+                : provisioning?.status === "INSTALLED"
+                  ? "Re-run ACELO Setup"
+                  : "Set up ACELO in Fabric"}
             </button>
 
             {provisioning?.status === "FAILED" && stage === "idle" && (
@@ -844,15 +1021,267 @@ export default function Settings() {
             )}
           </div>
 
-          {!connected && (
-            <p className="mt-3 text-xs text-ink-muted">
-              Test the connection successfully before setting up ACELO.
+          {provisionBlockedReason && stage === "idle" && (
+            <p data-testid="provision-blocked-reason" className="mt-3 text-xs text-ink-muted">
+              {provisionBlockedReason}
             </p>
           )}
-          {provisioning?.deployable === false && (
+          {provisioning && discovered && (
+            provisioning.default_lakehouse ? (
+              <div data-testid="default-lakehouse" className="mt-3 text-xs text-ink-muted">
+                <p>
+                  Default Lakehouse for the notebook:{" "}
+                  <span className="font-medium text-ink">
+                    {provisioning.default_lakehouse.name || provisioning.default_lakehouse.id}
+                  </span>
+                </p>
+                {/* What Fabric reported back after the last setup — evidence, not intent. */}
+                {provisioning.lakehouse_binding?.status === "VERIFIED" && (
+                  <p className="mt-1 flex items-center gap-1 text-signal-low">
+                    <CheckCircle2 size={12} /> Verified as the notebook&apos;s default Lakehouse in
+                    Fabric.
+                  </p>
+                )}
+                {provisioning.lakehouse_binding &&
+                  provisioning.lakehouse_binding.status !== "VERIFIED" && (
+                    <p data-testid="lakehouse-binding-problem" className="mt-1 text-signal-medium">
+                      {provisioning.lakehouse_binding.status === "MISSING"
+                        ? "The deployed notebook has NO default Lakehouse. Pipeline runs will fail with \"No default context found\"."
+                        : provisioning.lakehouse_binding.status === "MISMATCH"
+                          ? `The deployed notebook's default Lakehouse is ${provisioning.lakehouse_binding.bound_name ?? provisioning.lakehouse_binding.bound_id}, not the configured one.`
+                          : "The notebook's default Lakehouse could not be verified."}{" "}
+                      Click &quot;{provisioning.status === "UPDATE_AVAILABLE" ? "Update" : "Re-run"}
+                      &quot; below to redeploy with the binding.
+                    </p>
+                  )}
+                {!provisioning.lakehouse_binding && (
+                  <p className="mt-1">Not yet verified — run setup to deploy and read back the binding.</p>
+                )}
+              </div>
+            ) : (
+              <p data-testid="no-lakehouse-warning" className="mt-3 text-xs text-signal-medium">
+                No default Lakehouse can be bound: discovery found none matching the Cluster
+                settings in this workspace. Pipeline runs will fail with &quot;No default context
+                found&quot;. Enter the Lakehouse ID (and its workspace ID if it is in another
+                workspace) in Cluster Settings, then re-run setup.
+              </p>
+            )
+          )}
+          {provisioning && (
+            <div className="mt-3 space-y-1 text-xs text-ink-muted">
+              <p data-testid="fabric-environment">
+                Spark libraries:{" "}
+                {provisioning.fabric_environment ? (
+                  <span className="font-medium text-ink">
+                    Fabric Environment {provisioning.fabric_environment.name}
+                  </span>
+                ) : (
+                  <span>
+                    workspace default Environment. The notebook needs xgboost there, or set a
+                    Fabric Environment ID in Cluster Settings and re-run setup.
+                  </span>
+                )}
+              </p>
+              <p data-testid="execution-path">
+                Execution:{" "}
+                <span className="font-medium text-ink">
+                  {provisioning.execution_type === "pipeline" ? "Pipeline" : "Direct notebook"}
+                </span>
+                {provisioning.pipeline && (
+                  <>
+                    {" · "}
+                    {provisioning.pipeline.name}:{" "}
+                    {provisioning.pipeline.ready ? (
+                      <span className="text-signal-low">deployed</span>
+                    ) : (
+                      <span className="text-signal-medium">
+                        {provisioning.pipeline.message ?? "not deployed"}
+                      </span>
+                    )}
+                  </>
+                )}
+              </p>
+            </div>
+          )}
+          {provisioning?.status === "UPDATE_AVAILABLE" && (
             <p className="mt-3 text-xs text-signal-medium">
-              This ACELO build has no optimization notebooks bundled, so there is nothing to deploy.
+              The notebook deployed in Fabric is v{provisioning.package_version_installed}; this ACELO
+              build ships v{provisioning.package_version_available}. Update it so runs include the
+              runtime parameter trace.
             </p>
+          )}
+        </section>
+
+        {/* ---------------- Cluster settings ---------------- */}
+        <section className="surface p-6">
+          <h2 className="flex items-center gap-2 text-lg font-semibold text-ink">
+            Cluster Settings
+            {environment && clusterMissing.length === 0 && connected && (
+              <span className="flex items-center gap-1 text-sm font-medium text-signal-low">
+                <CheckCircle2 size={16} /> Configured
+              </span>
+            )}
+          </h2>
+          <p className="mt-1 text-sm text-ink-muted">
+            What the Cluster notebook reads and writes in your workspace. These are passed to the
+            notebook as runtime parameters on every run. Names only — no credentials.
+          </p>
+
+          <div className="mt-5 grid gap-5 md:grid-cols-2">
+            <Field
+              label="Source table"
+              value={clusterSettings.source_table}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, source_table: v })}
+              placeholder={REQUIRED_PLACEHOLDER}
+            />
+            <Field
+              label="Result table"
+              value={clusterSettings.result_table}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, result_table: v })}
+              placeholder={REQUIRED_PLACEHOLDER}
+            />
+            <Field
+              label="Lakehouse"
+              value={clusterSettings.lakehouse_database}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, lakehouse_database: v })}
+              placeholder={OPTIONAL_PLACEHOLDER}
+            />
+            <Field
+              label="Table schema"
+              value={clusterSettings.source_schema}
+              onChange={(v) =>
+                // One schema for source and result: a schema-enabled Lakehouse uses dbo for both.
+                setClusterSettings({ ...clusterSettings, source_schema: v, result_schema: v })
+              }
+              placeholder={`${OPTIONAL_PLACEHOLDER} (e.g. dbo for a schema-enabled Lakehouse)`}
+            />
+            <Field
+              label="Lakehouse ID"
+              value={clusterSettings.lakehouse_id}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, lakehouse_id: v })}
+              placeholder={`${OPTIONAL_PLACEHOLDER} (bound as the notebook's default Lakehouse)`}
+            />
+            <Field
+              label="Lakehouse workspace ID"
+              value={clusterSettings.lakehouse_workspace_id}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, lakehouse_workspace_id: v })}
+              placeholder={`${OPTIONAL_PLACEHOLDER} (only if the Lakehouse is in another workspace)`}
+            />
+            <Field
+              label="Approval tracking table"
+              value={clusterSettings.approval_tracking_table}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, approval_tracking_table: v })}
+              placeholder={`${OPTIONAL_PLACEHOLDER} (Delta table the Approvals tab reads via OneLake)`}
+            />
+            <Field
+              label="SQL analytics endpoint"
+              value={clusterSettings.sql_endpoint}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, sql_endpoint: v })}
+              placeholder={`${OPTIONAL_PLACEHOLDER} (only for the Results page; not used by Approvals)`}
+            />
+            <Field
+              label="Fabric Environment ID"
+              value={clusterSettings.fabric_environment_id}
+              onChange={(v) => setClusterSettings({ ...clusterSettings, fabric_environment_id: v })}
+              placeholder={`${OPTIONAL_PLACEHOLDER} (Spark libraries such as xgboost)`}
+            />
+            <label className="block">
+              <span className="mb-2 block text-sm font-medium text-ink">Execution type</span>
+              <select
+                aria-label="Execution type"
+                value={clusterSettings.execution_type || "notebook"}
+                onChange={(e) =>
+                  setClusterSettings({ ...clusterSettings, execution_type: e.target.value })
+                }
+                className="w-full rounded-md border border-panel-border bg-white px-3 py-2.5 text-sm text-ink outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500"
+              >
+                <option value="notebook">Notebook</option>
+                <option value="pipeline">Pipeline</option>
+              </select>
+            </label>
+            {clusterSettings.execution_type === "pipeline" && (
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium text-ink">Pipeline</span>
+                {pipelines.length === 0 ? (
+                  <p data-testid="no-pipelines" className="text-sm text-signal-medium">
+                    No pipeline found in this workspace. Run &quot;Set up ACELO in Fabric&quot; to
+                    deploy ACELO_Cluster_Optimization_Pipeline, then Discover Environment.
+                  </p>
+                ) : (
+                  <select
+                    aria-label="Pipeline"
+                    value={clusterSettings.pipeline_id || defaultPipelineId}
+                    onChange={(e) =>
+                      setClusterSettings({ ...clusterSettings, pipeline_id: e.target.value })
+                    }
+                    className="w-full rounded-md border border-panel-border bg-white px-3 py-2.5 text-sm text-ink outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500"
+                  >
+                    {pipelines.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                        {p.managed ? " (deployed by ACELO)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </label>
+            )}
+          </div>
+
+          <div className="mt-5 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => void handleSaveClusterSettings()}
+              disabled={settingsBlockedReason !== null || stage !== "idle"}
+              className="inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-brand-600 disabled:opacity-50"
+            >
+              {stage === "saving" && <Loader2 size={16} className="animate-spin" />}
+              Save Cluster Settings
+            </button>
+          </div>
+
+          {/* Confirmation reflects what the BACKEND persisted, not the form. */}
+          {savedState && stage === "idle" && (
+            <div data-testid="settings-saved" className="mt-4 rounded-md border border-panel-border bg-canvas-raised p-4 text-sm">
+              <p className="flex items-center gap-2 font-medium text-signal-low">
+                <CheckCircle2 size={16} /> Cluster settings saved
+              </p>
+              <dl className="mt-2 grid gap-1 text-ink-muted sm:grid-cols-2">
+                <SavedRow
+                  label="Execution type"
+                  value={savedState.execution?.execution_type === "pipeline" ? "Pipeline" : "Notebook"}
+                />
+                {savedState.execution?.execution_type === "pipeline" && (
+                  <SavedRow
+                    label="Pipeline"
+                    value={savedState.execution.pipeline?.name ?? savedState.execution.pipeline?.id ?? null}
+                  />
+                )}
+                <SavedRow label="Source" value={savedState.settings.source_table || null} />
+                <SavedRow label="Result" value={savedState.settings.result_table || null} />
+                <SavedRow label="Lakehouse" value={savedState.settings.lakehouse_database || null} />
+                <SavedRow label="Schema" value={savedState.settings.source_schema || null} />
+                <SavedRow label="SQL analytics endpoint" value={savedState.settings.sql_endpoint || null} />
+              </dl>
+            </div>
+          )}
+          {saveError && stage === "idle" && (
+            <div data-testid="settings-save-failed" className="mt-4 flex items-start gap-3 rounded-md border-l-4 border-l-signal-high bg-canvas-raised p-4">
+              <AlertCircle size={18} className="mt-0.5 shrink-0 text-signal-high" />
+              <div>
+                <p className="text-sm font-medium text-ink">Failed to save Cluster settings</p>
+                <p className="mt-1 text-sm text-ink-muted">{saveError}</p>
+              </div>
+            </div>
+          )}
+          {settingsBlockedReason ? (
+            <p className="mt-3 text-xs text-ink-muted">{settingsBlockedReason}</p>
+          ) : (
+            clusterMissing.length > 0 && (
+              <p data-testid="cluster-settings-missing" className="mt-3 text-xs text-signal-medium">
+                Required configuration missing: {clusterMissing.join(", ")}.
+              </p>
+            )
           )}
         </section>
 
@@ -863,9 +1292,10 @@ export default function Settings() {
             <ReadinessRow label="Authentication" ok={connected} />
             <ReadinessRow label="Workspace Access" ok={connected && Boolean(testResult?.workspace_name)} />
             <ReadinessRow label="Environment Discovery" ok={discovered} />
+            <ReadinessRow label="ACELO Package" ok={installed} />
             <ReadinessRow
-              label="ACELO Package"
-              ok={provisioning?.status === "INSTALLED"}
+              label="Cluster Settings"
+              ok={Boolean(environment) && connected && clusterMissing.length === 0}
             />
             <ReadinessRow label="Cluster" ok={Boolean(provisioning?.domains?.cluster?.ready)} />
             <ReadinessRow label="Query" ok={Boolean(provisioning?.domains?.query?.ready)} />
@@ -898,9 +1328,18 @@ export default function Settings() {
               </span>
             </p>
             {!clusterReady && readiness?.cluster_blocked_reason && (
-              <p className="mt-1 text-xs text-ink-muted">
+              <p data-testid="cluster-blocked-reason" className="mt-1 text-xs text-ink-muted">
                 {readiness.cluster_blocked_reason}
               </p>
+            )}
+            {clusterReady && (
+              <button
+                type="button"
+                onClick={() => navigate("/agent")}
+                className="mt-4 inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white hover:bg-brand-600"
+              >
+                Go to AI Agent
+              </button>
             )}
           </div>
         </section>
@@ -943,6 +1382,19 @@ function Detail({ label, value }: { label: string; value: string }) {
     <div>
       <dt className="text-xs uppercase tracking-wide text-ink-muted">{label}</dt>
       <dd className="mt-1 text-sm text-ink">{value}</dd>
+    </div>
+  );
+}
+
+const REQUIRED_PLACEHOLDER = "Required — not configured";
+const OPTIONAL_PLACEHOLDER = "Optional — not configured";
+
+/** One persisted setting; an unset value reads "Not configured", never a sample. */
+function SavedRow({ label, value }: { label: string; value: string | null }) {
+  return (
+    <div className="flex gap-2">
+      <dt>{label}:</dt>
+      <dd className={value ? "font-medium text-ink" : "italic"}>{value ?? "Not configured"}</dd>
     </div>
   );
 }

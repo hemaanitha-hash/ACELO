@@ -2,7 +2,7 @@ import React from "react";
 import { TrendingDown, ShieldAlert, RotateCcw } from "lucide-react";
 
 interface ImpactCardProps {
-  savingsMonthly: number;
+  savingsMonthly: number | null;
   risk: "Low" | "Medium" | "High";
   rollbackAvailable: boolean;
 }
@@ -20,7 +20,7 @@ export default function ImpactCard({ savingsMonthly, risk, rollbackAvailable }: 
       <div className="mt-2 flex items-center gap-2">
         <TrendingDown size={18} className="text-brand-400" />
         <p className="tabular text-2xl font-semibold text-brand-300">
-          ${savingsMonthly.toFixed(2)} / month
+          {savingsMonthly === null ? "Not available" : `$${savingsMonthly.toFixed(2)} / month`}
         </p>
       </div>
 

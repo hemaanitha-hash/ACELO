@@ -17,6 +17,8 @@ import {
   FABRIC_SCOPES,
   loginRequest,
   redirectLoginRequest,
+  SQL_ENDPOINT_SCOPES,
+  ONELAKE_SCOPES,
 } from "../authConfig";
 import { logLoginAttempt, logLoginResult } from "./authDiagnostics";
 
@@ -175,8 +177,60 @@ export async function getFabricToken(instance: IPublicClientApplication): Promis
   }
 }
 
+/**
+ * Delegated token for the Lakehouse SQL analytics endpoint, for result reads.
+ *
+ * Returns null instead of throwing: without it the backend reports a precise
+ * "cannot read results" error, which is more useful than failing the page.
+ * Silent first; an interactive prompt only when MSAL requires one (consent).
+ */
+export async function getSqlEndpointToken(instance: IPublicClientApplication): Promise<string | null> {
+  const account = instance.getActiveAccount() ?? instance.getAllAccounts()[0];
+  if (!account) return null;
+  try {
+    return (await instance.acquireTokenSilent({ scopes: SQL_ENDPOINT_SCOPES, account })).accessToken;
+  } catch (error) {
+    if (!(error instanceof InteractionRequiredAuthError)) return null;
+    try {
+      const result = await instance.acquireTokenPopup({
+        scopes: SQL_ENDPOINT_SCOPES,
+        redirectUri: fabricTokenPopupRequest.redirectUri,
+        account,
+      });
+      return result.accessToken;
+    } catch {
+      return null;
+    }
+  }
+}
+
 /** Display label for the signed-in account. Never includes a token. */
 export function describeAccount(account: AccountInfo | null): string {
   if (!account) return "";
   return account.name ? `${account.name} (${account.username})` : account.username;
+}
+
+/**
+ * Delegated OneLake token (Azure Storage audience) for direct Delta reads.
+ * Null when unavailable — the backend then reports a precise sign-in error
+ * instead of returning any data.
+ */
+export async function getOneLakeToken(instance: IPublicClientApplication): Promise<string | null> {
+  const account = instance.getActiveAccount() ?? instance.getAllAccounts()[0];
+  if (!account) return null;
+  try {
+    return (await instance.acquireTokenSilent({ scopes: ONELAKE_SCOPES, account })).accessToken;
+  } catch (error) {
+    if (!(error instanceof InteractionRequiredAuthError)) return null;
+    try {
+      const result = await instance.acquireTokenPopup({
+        scopes: ONELAKE_SCOPES,
+        redirectUri: fabricTokenPopupRequest.redirectUri,
+        account,
+      });
+      return result.accessToken;
+    } catch {
+      return null;
+    }
+  }
 }

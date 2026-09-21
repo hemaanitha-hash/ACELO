@@ -94,3 +94,42 @@ describe("describeClusterRecommendation", () => {
     ).toBeNull();
   });
 });
+
+describe("getJobResults (delegated result reads)", () => {
+  it("sends the SQL endpoint token in its own header only when provided", async () => {
+    const { getJobResults } = await import("./executionApi");
+    const fetchMock = vi.fn(async () => json(200, []));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getJobResults("job-1", "FABRIC-TOKEN", "SQL-TOKEN");
+    await getJobResults("job-1", "FABRIC-TOKEN");
+
+    const headers = (i: number) =>
+      (fetchMock.mock.calls[i] as unknown as [string, RequestInit])[1].headers as Record<string, string>;
+    expect(headers(0)["X-Fabric-Sql-Token"]).toBe("SQL-TOKEN");
+    expect(headers(0)["X-Fabric-Access-Token"]).toBe("FABRIC-TOKEN");
+    expect(headers(1)["X-Fabric-Sql-Token"]).toBeUndefined();
+  });
+});
+
+describe("missing is not zero", () => {
+  it("totals and counts are null when no row carries the value", () => {
+    const s = summariseClusterRows([{ optimization_label: "Optimized" }]);
+    expect(s.currentCost).toBeNull();
+    expect(s.monthlySavings).toBeNull();
+    expect(s.idleCount).toBeNull();
+    expect(s.oversizedCount).toBeNull();
+    expect(s.avgCpuUtil).toBeNull();
+    expect(s.savingsPct).toBeNull();
+  });
+
+  it("a genuine zero stays zero", () => {
+    const s = summariseClusterRows([
+      { potential_monthly_savings: 0, total_dbus_cost_usd: 0, idle_flag: 0, oversized_flag: 0 },
+    ]);
+    expect(s.monthlySavings).toBe(0);
+    expect(s.currentCost).toBe(0);
+    expect(s.idleCount).toBe(0);
+    expect(s.oversizedCount).toBe(0);
+  });
+});

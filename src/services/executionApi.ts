@@ -91,6 +91,8 @@ export interface JobRun {
   error_code: string | null;
   result_reference: string | null;
   platform_resource_id: string | null;
+  /** "notebook" | "pipeline" for Fabric runs; null for other platforms. */
+  execution_type?: string | null;
   started_at: string | null;
   completed_at: string | null;
 }
@@ -120,7 +122,18 @@ export interface JobResult {
 export interface EnvironmentRef {
   id: string;
   connection_id: string;
+  /** "user" / "personal" = Microsoft Account (delegated) sign-in. */
+  auth_mode?: string | null;
 }
+
+/** Where an analysis runs, and whether it needs the user's delegated token. */
+export interface ExecutionTarget {
+  connectionId: string;
+  delegated: boolean;
+}
+
+export const SESSION_EXPIRED_MESSAGE =
+  "Your Microsoft Fabric session has expired. Please sign in again.";
 
 export interface ConnectionSummary {
   id: string;
@@ -165,6 +178,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
  * the customer's.
  */
 export async function resolveConnectionId(): Promise<string> {
+  return (await resolveExecutionTarget()).connectionId;
+}
+
+/** The connection to run against plus its auth mode, from the backend's records. */
+export async function resolveExecutionTarget(): Promise<ExecutionTarget> {
   const connections = await request<ConnectionSummary[]>("/connections");
   if (connections.length === 0) {
     throw new ApiError(
@@ -188,8 +206,10 @@ export async function resolveConnectionId(): Promise<string> {
     );
   }
 
-  const connected = backed.find((c) => c.status === "connected");
-  return (connected ?? backed[0]).id;
+  const chosen = backed.find((c) => c.status === "connected") ?? backed[0];
+  const environment = environments.find((e) => e.connection_id === chosen.id);
+  const mode = environment?.auth_mode ?? "";
+  return { connectionId: chosen.id, delegated: mode === "user" || mode === "personal" };
 }
 
 /**
@@ -223,9 +243,21 @@ export function getJob(jobId: string, token?: string | null): Promise<AnalysisJo
   return request<AnalysisJob>(`/jobs/${jobId}`, { headers: fabricTokenHeader(token) });
 }
 
-export function getJobResults(jobId: string, token?: string | null): Promise<JobResult[]> {
+/**
+ * `sqlToken` is the delegated token for the Lakehouse SQL endpoint, needed by
+ * Microsoft Account environments to READ a completed run's result table. It is
+ * sent only on this call, in its own header, and never stored.
+ */
+export function getJobResults(
+  jobId: string,
+  token?: string | null,
+  sqlToken?: string | null
+): Promise<JobResult[]> {
   return request<JobResult[]>(`/jobs/${jobId}/results`, {
-    headers: fabricTokenHeader(token),
+    headers: {
+      ...fabricTokenHeader(token),
+      ...(sqlToken ? { "X-Fabric-Sql-Token": sqlToken } : {}),
+    },
   });
 }
 
@@ -276,13 +308,28 @@ export interface ClusterResult {
   runId: string;
   platform: string;
   platformRunId: string | null;
+  /** How the Fabric run was started: "notebook" or "pipeline". */
+  executionType: string | null;
+  /** The run's final platform status. */
+  runStatus: string | null;
   resultTable: string | null;
   retrievedAt: string | null;
   /** Uploaded file name, for file analyses. */
   sourceFile: string | null;
   /** "idle" | "oversized" when the request asked for one; only affects highlighting. */
   focus: string | null;
+  /** ACELO SENT vs NOTEBOOK RECEIVED, computed by the backend from the result rows. */
+  parameterVerification: ParameterVerification | null;
   rows: ClusterResultRow[];
+}
+
+export interface ParameterVerification {
+  status: "MATCHED" | "MISMATCH" | "UNVERIFIED";
+  sent: Record<string, string> | null;
+  received: Record<string, string> | null;
+  mismatches: { parameter: string; sent: string; received: string | null }[];
+  correlation_id_matched?: boolean;
+  reason?: string;
 }
 
 function toClusterResult(job: AnalysisJob, results: JobResult[]): ClusterResult | null {
@@ -300,10 +347,14 @@ function toClusterResult(job: AnalysisJob, results: JobResult[]): ClusterResult 
     runId: String(payload.run_id ?? run?.id ?? job.id),
     platform: String(payload.platform ?? job.platform),
     platformRunId: run?.platform_run_id ?? null,
+    executionType: run?.execution_type ?? null,
+    runStatus: run?.status ?? null,
     resultTable: (payload.result_reference as string | null) ?? null,
     retrievedAt: (payload.retrieved_at as string | null) ?? null,
     sourceFile: (payload.source_file as string | null) ?? null,
     focus: (payload.focus as string | null) ?? null,
+    parameterVerification:
+      (payload.parameter_verification as ParameterVerification | undefined) ?? null,
     rows,
   };
 }
@@ -316,7 +367,8 @@ function toClusterResult(job: AnalysisJob, results: JobResult[]): ClusterResult 
  * honest empty state rather than substituting demo figures.
  */
 export async function getLatestClusterResult(
-  token?: string | null
+  token?: string | null,
+  sqlToken?: string | null
 ): Promise<ClusterResult | null> {
   const jobs = await request<AnalysisJob[]>("/jobs", {
     headers: fabricTokenHeader(token),
@@ -326,7 +378,7 @@ export async function getLatestClusterResult(
     .reverse();
 
   for (const job of candidates) {
-    const result = toClusterResult(job, await getJobResults(job.id, token));
+    const result = toClusterResult(job, await getJobResults(job.id, token, sqlToken));
     if (result) return result;
   }
   return null;
@@ -335,10 +387,11 @@ export async function getLatestClusterResult(
 /** The cluster result of one specific job, or null if it has none (yet). */
 export async function getClusterResultForJob(
   jobId: string,
-  token?: string | null
+  token?: string | null,
+  sqlToken?: string | null
 ): Promise<ClusterResult | null> {
   const job = await getJob(jobId, token);
-  return toClusterResult(job, await getJobResults(jobId, token));
+  return toClusterResult(job, await getJobResults(jobId, token, sqlToken));
 }
 
 // ---------------------------------------------------------------------------
@@ -426,8 +479,17 @@ export function summariseClusterRows(rows: ClusterResultRow[]) {
     return values.length ? values.reduce((t, r) => t + num(r[key]), 0) / values.length : null;
   };
 
-  const monthlySavings = rows.reduce((t, r) => t + num(r.potential_monthly_savings), 0);
-  const currentCost = rows.reduce((t, r) => t + num(r.total_dbus_cost_usd), 0);
+  // Missing is not zero: a total or count is null when NO row carries the value.
+  // A genuine 0 (every row reports 0) stays 0.
+  const total = (key: keyof ClusterResultRow): number | null => {
+    const values = rows.filter((r) => typeof r[key] === "number");
+    return values.length ? values.reduce((t, r) => t + num(r[key]), 0) : null;
+  };
+  const flagged = (key: "idle_flag" | "oversized_flag"): number | null =>
+    rows.some((r) => typeof r[key] === "number") ? rows.filter((r) => r[key] === 1).length : null;
+
+  const monthlySavings = total("potential_monthly_savings");
+  const currentCost = total("total_dbus_cost_usd");
   const byLabel = rows.reduce<Record<string, number>>((acc, r) => {
     const label = String(r.optimization_label ?? "Unknown");
     acc[label] = (acc[label] ?? 0) + 1;
@@ -440,11 +502,14 @@ export function summariseClusterRows(rows: ClusterResultRow[]) {
     healthy: byLabel["Optimized"] ?? 0,
     atRisk: byLabel["Moderately Optimized"] ?? 0,
     critical: byLabel["Risky"] ?? 0,
-    idleCount: rows.filter((r) => r.idle_flag === 1).length,
-    oversizedCount: rows.filter((r) => r.oversized_flag === 1).length,
+    idleCount: flagged("idle_flag"),
+    oversizedCount: flagged("oversized_flag"),
     monthlySavings,
     currentCost,
-    savingsPct: currentCost > 0 ? (monthlySavings / currentCost) * 100 : null,
+    savingsPct:
+      currentCost !== null && currentCost > 0 && monthlySavings !== null
+        ? (monthlySavings / currentCost) * 100
+        : null,
     avgCpuUtil: mean("avg_cpu_util"),
     avgMemoryUtil: mean("avg_memory_util"),
     byLabel,

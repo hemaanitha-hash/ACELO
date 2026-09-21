@@ -56,7 +56,9 @@ export default function OpportunityTable({
                 </td>
                 <td className="px-5 py-4 text-ink-muted">{opp.domain}</td>
                 <td className="px-5 py-4 text-ink-muted">{opp.resource}</td>
-                <td className="px-5 py-4 tabular text-ink">{formatCurrency(opp.impactMonthly)}</td>
+                <td className="px-5 py-4 tabular text-ink">
+                  {opp.impactMonthly === null ? "Not available" : formatCurrency(opp.impactMonthly)}
+                </td>
                 <td className="px-5 py-4">
                   <StatusBadge label={opp.severity} kind="severity" />
                 </td>

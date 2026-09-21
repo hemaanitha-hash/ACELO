@@ -7,6 +7,7 @@ import HealthCard from "../components/HealthCard";
 import OpportunityTable from "../components/OpportunityTable";
 import Button from "../components/Button";
 import { getOverview } from "../services/api";
+import { getApprovalSummary, type ApprovalSummary } from "../services/approvalsApi";
 import type { OverviewData } from "../types";
 
 const quickActions = [
@@ -20,11 +21,17 @@ export default function Overview() {
   const navigate = useNavigate();
   const [data, setData] = useState<OverviewData | null>(null);
   const [loading, setLoading] = useState(true);
+  // Real approval counts; null when they could not be loaded (never faked as 0).
+  const [approvals, setApprovals] = useState<ApprovalSummary | null>(null);
 
   async function load() {
     setLoading(true);
-    const result = await getOverview();
+    const [result, counts] = await Promise.all([
+      getOverview(),
+      getApprovalSummary().catch(() => null),
+    ]);
     setData(result);
+    setApprovals(counts);
     setLoading(false);
   }
 
@@ -38,7 +45,7 @@ export default function Overview() {
         <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h1 className="text-display font-semibold text-ink">
-              Good morning, {data?.userName ?? "Hema"}
+              {data?.userName ? `Good morning, ${data.userName}` : "Good morning"}
             </h1>
             <p className="mt-2 max-w-xl text-sm text-ink-muted">
               Monitor, analyze and optimize your data platform with ACELO AI.
@@ -50,18 +57,17 @@ export default function Overview() {
         </div>
 
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-sm border border-panel-border bg-panel px-5 py-3 text-sm">
-          <span className="flex items-center gap-2 text-ink">
+          <span className="flex items-center gap-2 text-ink-muted">
             <CheckCircle2 size={15} className="text-brand-400" />
-            System Healthy
-          </span>
-          <span className="hidden h-4 w-px bg-panel-border sm:block" />
-          <span className="text-ink-muted">
-            Last analysis: {data ? `${data.lastAnalysisMinutesAgo} minutes ago` : "—"}
+            Last analysis:{" "}
+            {data?.lastAnalysisMinutesAgo != null
+              ? `${data.lastAnalysisMinutesAgo} minutes ago`
+              : "No analysis yet"}
           </span>
           <span className="hidden h-4 w-px bg-panel-border sm:block" />
           <span className="flex items-center gap-2 text-ink-muted">
             <span className="h-1.5 w-1.5 rounded-full bg-brand-400" />
-            {data?.platformConnected ?? "Databricks"} Connected
+            {data?.platformConnected ? `${data.platformConnected} Connected` : "No platform connected"}
           </span>
         </div>
 
@@ -88,6 +94,36 @@ export default function Overview() {
             icon={Activity}
           />
         </div>
+
+        {/* Approval KPIs from the real approval records. */}
+        <section>
+          <h2 className="mb-4 text-sm font-semibold text-ink">Approvals</h2>
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
+            {(
+              [
+                ["PENDING", "Pending Approvals"],
+                ["APPROVED", "Approved"],
+                ["REJECTED", "Rejected"],
+                ["EXECUTING", "Executing"],
+                ["COMPLETED", "Completed"],
+              ] as const
+            ).map(([status, label]) => (
+              <button
+                key={status}
+                type="button"
+                data-testid={`approval-kpi-${status}`}
+                onClick={() => navigate(`/approvals?status=${status}`)}
+                className="text-left"
+              >
+                <KpiCard
+                  label={label}
+                  value={loading ? "—" : approvals ? String(approvals[status]) : "Not available"}
+                  icon={ListChecks}
+                />
+              </button>
+            ))}
+          </div>
+        </section>
 
         <section>
           <h2 className="mb-4 text-sm font-semibold text-ink">Optimization health</h2>

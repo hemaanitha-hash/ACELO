@@ -16,7 +16,8 @@ export interface Opportunity {
   title: string;
   domain: Domain;
   resource: string;
-  impactMonthly: number;
+  /** null when the recommendation carries no savings figure (missing is not 0). */
+  impactMonthly: number | null;
   severity: Severity;
   status: OpportunityStatus;
   detectedAt: string;

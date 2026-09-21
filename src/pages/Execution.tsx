@@ -1,131 +1,111 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { CheckCircle2, PlayCircle } from "lucide-react";
+import { AlertCircle } from "lucide-react";
 import Layout from "../components/Layout";
-import ExecutionProgress from "../components/ExecutionProgress";
-import CheckpointCard from "../components/CheckpointCard";
-import Button from "../components/Button";
-import { getExecutionStatus } from "../services/api";
-import type { ExecutionState } from "../types";
+import { ApiError } from "../services/environmentApi";
+import { display, listApprovals, usd, type Approval } from "../services/approvalsApi";
 
+/**
+ * Executions of APPROVED optimizations — real records only. An execution exists
+ * here only after someone approved a recommendation AND explicitly executed it;
+ * approved-but-not-executed items are listed as ready so the step stays visible.
+ */
 export default function Execution() {
   const navigate = useNavigate();
-  const [execution, setExecution] = useState<ExecutionState | null>(null);
+  const [rows, setRows] = useState<Approval[]>([]);
+  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [running, setRunning] = useState(false);
-  const [completed, setCompleted] = useState(false);
-  const interval = useRef<number | null>(null);
 
-  useEffect(() => {
+  async function load() {
     setLoading(true);
-    getExecutionStatus("EXE-901").then((result) => {
-      setExecution(result);
+    try {
+      setRows(await listApprovals({ status: ["APPROVED", "EXECUTING", "COMPLETED", "FAILED"] }));
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof ApiError ? e.message : "Unable to load executions.");
+    } finally {
       setLoading(false);
-    });
-    return () => {
-      if (interval.current) window.clearInterval(interval.current);
-    };
-  }, []);
-
-  function runDemoExecution() {
-    if (!execution || running || completed) return;
-    setRunning(true);
-
-    const totalDurationMs = 4000;
-    const tickMs = 120;
-    const totalTicks = totalDurationMs / tickMs;
-    let tick = 0;
-
-    const startProgress = execution.progressPercent;
-    const startProcessed = execution.workloadsProcessed;
-    const startElapsed = execution.elapsedSeconds;
-
-    interval.current = window.setInterval(() => {
-      tick += 1;
-      const ratio = Math.min(tick / totalTicks, 1);
-
-      setExecution((prev) => {
-        if (!prev) return prev;
-        const progressPercent = startProgress + (100 - startProgress) * ratio;
-        const workloadsProcessed = Math.round(
-          startProcessed + (prev.workloadsTotal - startProcessed) * ratio
-        );
-        const elapsedSeconds = startElapsed + Math.round(ratio * 45);
-        return {
-          ...prev,
-          progressPercent,
-          workloadsProcessed,
-          elapsedSeconds,
-          stage: ratio >= 1 ? "Validation" : "Execution",
-        };
-      });
-
-      if (ratio >= 1) {
-        if (interval.current) window.clearInterval(interval.current);
-        setRunning(false);
-        setCompleted(true);
-      }
-    }, tickMs);
+    }
   }
 
+  useEffect(() => {
+    void load();
+  }, []);
+
   return (
-    <Layout pageName="Execution">
+    <Layout pageName="Execution" onRefresh={() => void load()}>
       <div className="flex flex-col gap-6">
         <div>
-          <h1 className="text-display font-semibold text-ink">Execution Center</h1>
+          <h1 className="text-display font-semibold text-ink">Execution</h1>
           <p className="mt-2 text-sm text-ink-muted">
-            Controlled, checkpointed execution with validation at every stage.
+            Approved optimizations and their real platform executions.
           </p>
         </div>
 
-        {loading && (
-          <div className="surface py-16 text-center text-sm text-ink-muted">Loading execution...</div>
+        {loading && <div className="surface py-16 text-center text-sm text-ink-muted">Loading executions...</div>}
+
+        {!loading && error && (
+          <div className="surface border-l-4 border-l-signal-high p-5">
+            <div className="flex items-start gap-3">
+              <AlertCircle size={18} className="mt-0.5 shrink-0 text-signal-high" />
+              <p className="text-sm text-ink">{error}</p>
+            </div>
+          </div>
         )}
 
-        {execution && (
-          <>
-            <div className="surface flex flex-wrap items-center justify-between gap-4 p-5">
-              <div>
-                <p className="label-eyebrow">{execution.id}</p>
-                <h2 className="mt-1 text-sm font-semibold text-ink">{execution.title}</h2>
-                <p className="mt-1 text-xs text-ink-muted">{execution.resource}</p>
-              </div>
-              {!completed ? (
-                <Button
-                  icon={<PlayCircle size={16} />}
-                  onClick={runDemoExecution}
-                  disabled={running}
-                >
-                  {running ? "Running..." : "Run Demo Execution"}
-                </Button>
-              ) : (
-                <span className="flex items-center gap-2 text-sm font-medium text-brand-300">
-                  <CheckCircle2 size={16} />
-                  Completed
-                </span>
-              )}
+        {!loading && !error && rows.length === 0 && (
+          <div className="surface py-16 text-center">
+            <p className="text-sm font-medium text-ink">No approved optimizations yet.</p>
+            <p className="mt-1 text-sm text-ink-muted">
+              Approve a recommendation in Approvals, then execute it from its review page.
+            </p>
+          </div>
+        )}
+
+        {!loading && !error && rows.length > 0 && (
+          <section className="surface p-5">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead>
+                  <tr className="border-b border-panel-border text-xs uppercase text-ink-muted">
+                    <th className="py-2 pr-4 font-medium">Cluster</th>
+                    <th className="py-2 pr-4 font-medium">Status</th>
+                    <th className="py-2 pr-4 font-medium">Execution ID</th>
+                    <th className="py-2 pr-4 font-medium">Validation</th>
+                    <th className="py-2 pr-4 font-medium">Savings</th>
+                    <th className="py-2 pr-4 font-medium">Approved by</th>
+                    <th className="py-2 pr-4 font-medium" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((a) => (
+                    <tr key={a.approval_id} className="border-b border-panel-border/60">
+                      <td className="py-2 pr-4 text-ink">{a.resource_name}</td>
+                      <td className="py-2 pr-4 text-xs font-semibold text-ink">
+                        {a.status === "APPROVED" ? "APPROVED · ready to execute" : a.status}
+                        {a.status === "FAILED" && a.execution_error && (
+                          <span className="block font-normal text-signal-high">{a.execution_error}</span>
+                        )}
+                      </td>
+                      <td className="py-2 pr-4 font-mono text-xs text-ink-muted">{a.execution_id ?? "—"}</td>
+                      <td className="py-2 pr-4 text-ink-muted">{a.validation_status ?? "—"}</td>
+                      <td className="tabular py-2 pr-4 text-ink">{display(a.potential_monthly_savings, usd)}</td>
+                      <td className="py-2 pr-4 text-ink-muted">{a.approved_by ?? "Not available"}</td>
+                      <td className="py-2 pr-4">
+                        <button
+                          type="button"
+                          onClick={() => navigate(`/approvals/${a.approval_id}`)}
+                          className="rounded-sm border border-brand-500 px-3 py-1 text-xs font-medium text-brand-500 hover:bg-brand-500/10"
+                        >
+                          Open
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
-
-            <ExecutionProgress
-              currentStage={execution.stage}
-              progressPercent={execution.progressPercent}
-              workloadsProcessed={execution.workloadsProcessed}
-              workloadsTotal={execution.workloadsTotal}
-              elapsedSeconds={execution.elapsedSeconds}
-            />
-
-            <CheckpointCard />
-
-            {completed && (
-              <div className="surface p-6 text-center">
-                <p className="text-sm font-semibold text-ink">Optimization completed successfully</p>
-                <p className="mt-1 text-sm text-ink-muted">Post-execution validation passed.</p>
-                <Button className="mt-4" onClick={() => navigate("/results")}>
-                  View Result
-                </Button>
-              </div>
-            )}
-          </>
+          </section>
         )}
       </div>
     </Layout>

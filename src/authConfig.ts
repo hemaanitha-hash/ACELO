@@ -156,6 +156,26 @@ export const fabricTokenPopupRequest = {
   redirectUri: MSAL_REDIRECT_URI,
 };
 
+/**
+ * Delegated scope for the Lakehouse SQL analytics endpoint, used ONLY to read a
+ * run's result table as the signed-in user. The Fabric API token's audience is
+ * api.fabric.microsoft.com, which the SQL endpoint does not accept.
+ *
+ * Requires the app registration to have the delegated API permission
+ * "Azure SQL Database > user_impersonation".
+ */
+export const SQL_ENDPOINT_SCOPES = ["https://database.windows.net//user_impersonation"];
+
+/**
+ * Delegated scope for OneLake, used to read Lakehouse Delta tables DIRECTLY
+ * (the approval tracking table) — no SQL analytics endpoint involved. OneLake
+ * does not accept the Fabric API token.
+ *
+ * Requires the delegated API permission "Azure Storage > user_impersonation" —
+ * the Entra permission Fabric OneLake uses. No Azure Storage account is involved.
+ */
+export const ONELAKE_SCOPES = ["https://storage.azure.com/user_impersonation"];
+
 /** True when the deployment has been given an App Registration to use. */
 export const isMsalConfigured = (): boolean => Boolean(MSAL_CLIENT_ID && MSAL_AUTHORITY);
 

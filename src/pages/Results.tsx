@@ -5,7 +5,7 @@ import Layout from "../components/Layout";
 import Button from "../components/Button";
 import { useMsal } from "@azure/msal-react";
 import { ApiError } from "../services/environmentApi";
-import { FabricAuthError, getFabricToken } from "../services/fabricAuth";
+import { FabricAuthError, getFabricToken, getSqlEndpointToken } from "../services/fabricAuth";
 import {
   describeClusterRecommendation,
   getClusterResultForJob,
@@ -14,7 +14,15 @@ import {
   summariseClusterRows,
   type ClusterResult,
   type ClusterResultRow,
+  type ParameterVerification,
 } from "../services/executionApi";
+import {
+  listApprovals,
+  requiresApproval,
+  sendToApproval,
+  STATUS_TEXT,
+  type Approval,
+} from "../services/approvalsApi";
 
 /**
  * Cluster optimization results.
@@ -51,7 +59,12 @@ export default function Results() {
           if (!(e instanceof FabricAuthError)) throw e;
         }
       }
-      return jobId ? getClusterResultForJob(jobId, token) : getLatestClusterResult(token);
+      // Needed only when a result must still be read from the Lakehouse SQL
+      // endpoint as the signed-in user; results already stored ignore it.
+      const sqlToken = account ? await getSqlEndpointToken(instance) : null;
+      return jobId
+        ? getClusterResultForJob(jobId, token, sqlToken)
+        : getLatestClusterResult(token, sqlToken);
     };
 
     setLoading(true);
@@ -89,6 +102,38 @@ export default function Results() {
   );
 
   const isFile = result?.platform === "file";
+
+  // Approval state per cluster for THIS run, from the real approval records.
+  const [approvalsByResource, setApprovalsByResource] = useState<Record<string, Approval>>({});
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+  const [sending, setSending] = useState<string | null>(null);
+
+  async function loadApprovals(runId: string) {
+    try {
+      const rows = await listApprovals({ aceloRunId: runId });
+      setApprovalsByResource(Object.fromEntries(rows.map((a) => [a.resource_id, a])));
+    } catch {
+      setApprovalError("Approval status could not be loaded.");
+    }
+  }
+
+  useEffect(() => {
+    if (result?.runId) void loadApprovals(result.runId);
+  }, [result?.runId]);
+
+  async function handleSendToApproval(resourceId: string) {
+    if (!result) return;
+    setSending(resourceId);
+    setApprovalError(null);
+    try {
+      await sendToApproval(result.runId, resourceId);
+      await loadApprovals(result.runId);
+    } catch (e: unknown) {
+      setApprovalError(e instanceof ApiError ? e.message : "Approval could not be saved. Please try again.");
+    } finally {
+      setSending(null);
+    }
+  }
 
   return (
     <Layout pageName="Results">
@@ -159,19 +204,19 @@ export default function Results() {
               <Kpi label="Avg memory utilization" value={pct(summary.avgMemoryUtil)} />
               <Kpi
                 label="Idle clusters"
-                value={String(summary.idleCount)}
-                tone={summary.idleCount > 0 ? "warn" : undefined}
+                value={orNotAvailable(summary.idleCount, String)}
+                tone={(summary.idleCount ?? 0) > 0 ? "warn" : undefined}
               />
               <Kpi
                 label="Oversized clusters"
-                value={String(summary.oversizedCount)}
-                tone={summary.oversizedCount > 0 ? "warn" : undefined}
+                value={orNotAvailable(summary.oversizedCount, String)}
+                tone={(summary.oversizedCount ?? 0) > 0 ? "warn" : undefined}
               />
-              <Kpi label="Current cost" value={summary.currentCost > 0 ? usd(summary.currentCost) : "—"} />
+              <Kpi label="Current cost" value={orNotAvailable(summary.currentCost, usd)} />
               <Kpi
                 label="Estimated savings"
-                value={summary.monthlySavings > 0 ? `${usd(summary.monthlySavings)}/mo` : "—"}
-                tone="good"
+                value={orNotAvailable(summary.monthlySavings, (v) => `${usd(v)}/mo`)}
+                tone={summary.monthlySavings !== null ? "good" : undefined}
               />
             </div>
 
@@ -271,6 +316,9 @@ export default function Results() {
                   ))}
                 </div>
               </div>
+              {approvalError && (
+                <p data-testid="approval-error" className="mb-3 text-xs text-signal-high">{approvalError}</p>
+              )}
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-sm">
                   <thead>
@@ -288,6 +336,7 @@ export default function Results() {
                       <th className="py-2 pr-4 font-medium">Efficiency</th>
                       <th className="py-2 pr-4 font-medium">Cost</th>
                       <th className="py-2 pr-4 font-medium">Savings / mo</th>
+                      <th className="py-2 pr-4 font-medium">Approval</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -330,11 +379,20 @@ export default function Results() {
                             ? usd(row.potential_monthly_savings)
                             : "—"}
                         </td>
+                        <td className="py-2 pr-4 text-xs">
+                          <ApprovalCell
+                            row={row}
+                            approval={approvalsByResource[resourceIdOf(row)]}
+                            sending={sending === resourceIdOf(row)}
+                            onSend={() => void handleSendToApproval(resourceIdOf(row))}
+                            onOpen={(id) => navigate(`/approvals/${id}`)}
+                          />
+                        </td>
                       </tr>
                     ))}
                     {visibleRows.length === 0 && (
                       <tr>
-                        <td colSpan={13} className="py-4 text-center text-sm text-ink-muted">
+                        <td colSpan={14} className="py-4 text-center text-sm text-ink-muted">
                           No clusters match this filter.
                         </td>
                       </tr>
@@ -349,17 +407,33 @@ export default function Results() {
 
             <section className="surface p-5">
               <p className="label-eyebrow mb-2">Run</p>
-              <dl className="grid gap-3 sm:grid-cols-4">
+              <dl className="grid gap-3 sm:grid-cols-3 lg:grid-cols-5">
                 <Detail
                   label="Source"
                   value={isFile ? `Uploaded file · ${result.sourceFile ?? "—"}` : result.platform}
                 />
                 <Detail label="ACELO run" value={result.runId} mono />
                 <Detail
-                  label={isFile ? "Platform job" : `${result.platform} job`}
+                  label={
+                    isFile
+                      ? "Platform job"
+                      : result.platform === "fabric"
+                        ? result.executionType === "pipeline"
+                          ? "Fabric pipeline run ID"
+                          : "Fabric run ID"
+                        : `${result.platform} job`
+                  }
                   value={result.platformRunId ?? "—"}
                   mono
                 />
+                {!isFile && (
+                  <Detail
+                    label="Execution"
+                    value={`${result.executionType === "pipeline" ? "Pipeline" : "Notebook"} · ${
+                      result.runStatus ?? "—"
+                    }`}
+                  />
+                )}
                 <Detail
                   label="Analysed"
                   value={
@@ -368,6 +442,10 @@ export default function Results() {
                 />
               </dl>
             </section>
+
+            {result.parameterVerification && (
+              <ParameterEvidence verification={result.parameterVerification} />
+            )}
 
             <div className="flex gap-3">
               <Button variant="ghost" onClick={() => navigate("/agent")}>
@@ -386,6 +464,49 @@ export default function Results() {
   );
 }
 
+/** Same identity the backend uses for approvals: cluster_id, else cluster_name. */
+function resourceIdOf(row: ClusterResultRow): string {
+  return String(row.cluster_id ?? "").trim() || String(row.cluster_name ?? "").trim();
+}
+
+function ApprovalCell({
+  row,
+  approval,
+  sending,
+  onSend,
+  onOpen,
+}: {
+  row: ClusterResultRow;
+  approval: Approval | undefined;
+  sending: boolean;
+  onSend: () => void;
+  onOpen: (approvalId: string) => void;
+}) {
+  if (approval) {
+    return (
+      <button
+        type="button"
+        data-testid="approval-status"
+        onClick={() => onOpen(approval.approval_id)}
+        className="font-medium text-brand-500 hover:underline"
+      >
+        {STATUS_TEXT[approval.status]}
+      </button>
+    );
+  }
+  if (!requiresApproval(row)) return <span className="text-ink-faint">Not required</span>;
+  return (
+    <button
+      type="button"
+      onClick={onSend}
+      disabled={sending}
+      className="rounded-sm border border-brand-500 px-2 py-0.5 font-medium text-brand-500 hover:bg-brand-500/10 disabled:opacity-50"
+    >
+      {sending ? "Sending..." : "Send to Approval"}
+    </button>
+  );
+}
+
 function num(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -394,8 +515,15 @@ function fmt(value: unknown, digits: number): string {
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
 }
 
+const NOT_AVAILABLE = "Not available";
+
+/** A metric the data does not provide is "Not available" — never a fabricated 0. */
+function orNotAvailable(value: number | null, format: (v: number) => string): string {
+  return value === null ? NOT_AVAILABLE : format(value);
+}
+
 function pct(value: number | null): string {
-  return value === null ? "—" : `${value.toFixed(1)}%`;
+  return orNotAvailable(value, (v) => `${v.toFixed(1)}%`);
 }
 
 function usd(value: number): string {
@@ -500,6 +628,60 @@ function HealthKpi({
         <span className="text-signal-high">{critical}</span>
       </p>
     </div>
+  );
+}
+
+/** ACELO SENT vs NOTEBOOK RECEIVED for this run — evidence, not a claim. */
+function ParameterEvidence({ verification }: { verification: ParameterVerification }) {
+  const colour =
+    verification.status === "MATCHED"
+      ? "text-signal-low"
+      : verification.status === "MISMATCH"
+        ? "text-signal-high"
+        : "text-signal-medium";
+  const names = Object.keys(verification.sent ?? {}).sort();
+  return (
+    <section className="surface p-5">
+      <p className="label-eyebrow mb-2">Notebook runtime parameters</p>
+      <p className="text-sm">
+        <span className="text-ink-muted">Verification: </span>
+        <span data-testid="verification-status" className={`font-medium ${colour}`}>
+          {verification.status}
+        </span>
+        {verification.correlation_id_matched !== undefined && (
+          <span className="ml-3 text-xs text-ink-muted">
+            correlation id {verification.correlation_id_matched ? "matched" : "did NOT match"}
+          </span>
+        )}
+      </p>
+      {verification.reason && <p className="mt-1 text-xs text-ink-muted">{verification.reason}</p>}
+      {names.length > 0 && (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="border-b border-panel-border text-xs uppercase text-ink-muted">
+                <th className="py-2 pr-4 font-medium">Parameter</th>
+                <th className="py-2 pr-4 font-medium">ACELO sent</th>
+                <th className="py-2 pr-4 font-medium">Notebook received</th>
+              </tr>
+            </thead>
+            <tbody>
+              {names.map((name) => (
+                <tr key={name} className="border-b border-panel-border/60">
+                  <td className="py-2 pr-4 font-mono text-xs text-ink">{name}</td>
+                  <td className="py-2 pr-4 font-mono text-xs text-ink-muted">
+                    {verification.sent?.[name]}
+                  </td>
+                  <td className="py-2 pr-4 font-mono text-xs text-ink-muted">
+                    {verification.received ? verification.received[name] ?? "(not received)" : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 

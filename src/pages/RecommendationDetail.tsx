@@ -7,7 +7,7 @@ import ImpactCard from "../components/ImpactCard";
 import StatusBadge from "../components/StatusBadge";
 import Button from "../components/Button";
 import Modal from "../components/Modal";
-import { getRecommendation, requestApproval } from "../services/api";
+import { getRecommendation } from "../services/api";
 import type { Opportunity } from "../types";
 
 export default function RecommendationDetail() {
@@ -16,8 +16,6 @@ export default function RecommendationDetail() {
   const [opportunity, setOpportunity] = useState<Opportunity | null>(null);
   const [loading, setLoading] = useState(true);
   const [reviewOpen, setReviewOpen] = useState(false);
-  const [requesting, setRequesting] = useState(false);
-  const [requested, setRequested] = useState(false);
 
   useEffect(() => {
     if (!id) return;
@@ -27,14 +25,6 @@ export default function RecommendationDetail() {
       setLoading(false);
     });
   }, [id]);
-
-  async function handleRequestApproval() {
-    if (!opportunity) return;
-    setRequesting(true);
-    await requestApproval(opportunity.id);
-    setRequesting(false);
-    setRequested(true);
-  }
 
   return (
     <Layout pageName="Recommendation Detail">
@@ -71,7 +61,7 @@ export default function RecommendationDetail() {
               <h1 className="mt-1.5 text-display font-semibold text-ink">{opportunity.title}</h1>
               <p className="mt-1 text-sm text-ink-muted">{opportunity.resource}</p>
             </div>
-            <StatusBadge label={requested ? "Approved" : opportunity.status} kind="status" />
+            <StatusBadge label={opportunity.status} kind="status" />
           </div>
 
           <div className="grid gap-6 lg:grid-cols-[1fr_300px]">
@@ -90,15 +80,9 @@ export default function RecommendationDetail() {
                 <Button variant="secondary" onClick={() => setReviewOpen(true)}>
                   Review Proposed Change
                 </Button>
-                <Button onClick={handleRequestApproval} disabled={requesting || requested}>
-                  {requested ? "Approval requested" : requesting ? "Requesting..." : "Request Approval"}
-                </Button>
+                {/* Approvals are created from real run results, not from here. */}
+                <Button onClick={() => navigate("/approvals")}>Go to Approvals</Button>
               </div>
-              {requested && (
-                <p className="text-sm text-brand-300">
-                  This recommendation has been sent to the Approval Center for human review.
-                </p>
-              )}
             </div>
 
             <ImpactCard

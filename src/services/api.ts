@@ -2,17 +2,10 @@
 // ACELO SERVICE LAYER - Connected to FastAPI Backend with Resilient Fallback
 // ============================================================================
 
-import {
-  demoExecution,
-  demoExecutionResult,
-} from "../data/demoData";
 import type {
   ConnectedPlatform,
   OverviewData,
   Opportunity,
-  ApprovalRequest,
-  ExecutionState,
-  ExecutionResult,
   AuditEntry,
   Domain,
 } from "../types";
@@ -94,13 +87,13 @@ export async function getOptimizations(): Promise<Opportunity[]> {
       title: item.title ?? item.resource,
       domain: (item.domain ? item.domain.charAt(0).toUpperCase() + item.domain.slice(1) : "Query") as Domain,
       resource: item.resource ?? "Compute Resource",
-      impactMonthly: item.estimated_savings_monthly ?? 1200,
-      severity: item.estimated_savings_monthly > 2000 ? "High" : "Medium",
+      impactMonthly: typeof item.estimated_savings_monthly === "number" ? item.estimated_savings_monthly : null,
+      severity: (item.estimated_savings_monthly ?? 0) > 2000 ? "High" : "Medium",
       status: item.status === "approved" ? "Approved" : item.status === "rejected" ? "Rejected" : "Review",
-      detectedAt: "Today",
-      whyFlagged: item.details?.issue ?? "High resource usage detected",
-      aiAnalysis: item.details?.evidence ?? item.description ?? "Telemetry identified resource bottleneck",
-      recommendedAction: item.details?.optimized_query ?? item.details?.recommendation ?? "Apply rightsizing or query refactoring",
+      detectedAt: item.created_at ? new Date(item.created_at).toLocaleDateString() : "Not available",
+      whyFlagged: item.details?.issue ?? "Not available",
+      aiAnalysis: item.details?.evidence ?? item.description ?? "Not available",
+      recommendedAction: item.details?.optimized_query ?? item.details?.recommendation ?? "Not available",
       risk: "Low",
       rollbackAvailable: true,
     }));
@@ -113,59 +106,7 @@ export async function getRecommendation(id: string): Promise<Opportunity | undef
   return opps.find((o) => o.id === id);
 }
 
-export async function getApprovals(): Promise<ApprovalRequest[]> {
-  const data = await fetchJson<any[]>(`${API_BASE}/approvals`);
-  if (data && Array.isArray(data) && data.length > 0) {
-    return data.map((item) => ({
-      id: item.id,
-      opportunityId: item.recommendation_id ?? item.id,
-      title: item.resource ?? "Query Optimization",
-      domain: (item.domain ? item.domain.charAt(0).toUpperCase() + item.domain.slice(1) : "Query") as Domain,
-      requestedBy: item.requested_by ?? "ACELO FinOps Agent",
-      potentialSavings: item.estimated_monthly_savings ?? 1450,
-      risk: (item.confidence === "high" ? "Low" : "Medium") as any,
-      rollbackAvailable: true,
-      checklist: [
-        { label: "Execution plan validated against Fabric Lakehouse", passed: true },
-        { label: "SLA & workload dependency check", passed: true },
-        { label: "Zero data corruption & semantic equivalency verified", passed: true },
-      ],
-    }));
-  }
-  return [];
-}
-
-export async function requestApproval(opportunityId: string): Promise<{ ok: true }> {
-  return { ok: true };
-}
-
-export async function approveOptimization(approvalId: string): Promise<{ ok: boolean; message?: string }> {
-  const res = await fetchJson<any>(`${API_BASE}/approvals/${approvalId}/approve`, {
-    method: "POST",
-  });
-  if (res && res.ok) return { ok: true, message: res.message };
-  return { ok: true };
-}
-
-export async function rejectOptimization(approvalId: string): Promise<{ ok: boolean }> {
-  const res = await fetchJson<any>(`${API_BASE}/approvals/${approvalId}/reject`, {
-    method: "POST",
-  });
-  if (res && res.ok) return { ok: true };
-  return { ok: true };
-}
-
-export async function startExecution(opportunityId: string): Promise<ExecutionState> {
-  return demoExecution;
-}
-
-export async function getExecutionStatus(executionId: string): Promise<ExecutionState> {
-  return demoExecution;
-}
-
-export async function getExecutionResult(executionId: string): Promise<ExecutionResult> {
-  return demoExecutionResult;
-}
+// Approvals and executions: see services/approvalsApi.ts (real data only).
 
 export async function getHistory(): Promise<AuditEntry[]> {
   const data = await fetchJson<any[]>(`${API_BASE}/history`);
@@ -179,12 +120,12 @@ export async function getHistory(): Promise<AuditEntry[]> {
       result: "Completed",
       detail: {
         agentDecision: item.summary,
-        analysis: "Fabric telemetry collected from Delta lakehouse and query logs.",
-        recommendation: item.payload?.summary ?? "Executed optimization with verified metrics.",
-        approval: item.payload?.approved_by ?? "Hema",
-        execution: item.payload?.platform_run_id ?? "Fabric Job Execution Verified",
-        validation: "Performance improved. Metrics recorded in finops_optimizer.",
-        rollback: "Available via snapshot restore.",
+        analysis: item.payload?.analysis ?? "Not available",
+        recommendation: item.payload?.summary ?? "Not available",
+        approval: item.payload?.approved_by ?? "Not available",
+        execution: item.payload?.platform_run_id ?? "Not available",
+        validation: item.payload?.validation ?? "Not available",
+        rollback: item.payload?.rollback ?? "Not available",
       },
     }));
   }

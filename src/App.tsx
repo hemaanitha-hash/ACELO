@@ -6,6 +6,7 @@ import Optimizations from "./pages/Optimizations";
 import Recommendations from "./pages/Recommendations";
 import RecommendationDetail from "./pages/RecommendationDetail";
 import Approvals from "./pages/Approvals";
+import ApprovalDetail from "./pages/ApprovalDetail";
 import Execution from "./pages/Execution";
 import Results from "./pages/Results";
 import History from "./pages/History";
@@ -21,6 +22,7 @@ export default function App() {
       <Route path="/recommendations" element={<Recommendations />} />
       <Route path="/recommendations/:id" element={<RecommendationDetail />} />
       <Route path="/approvals" element={<Approvals />} />
+      <Route path="/approvals/:id" element={<ApprovalDetail />} />
       <Route path="/execution" element={<Execution />} />
       <Route path="/results" element={<Results />} />
       <Route path="/history" element={<History />} />

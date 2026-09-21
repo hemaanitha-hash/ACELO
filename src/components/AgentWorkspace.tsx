@@ -1,13 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { AlertCircle, ArrowUp, FileText, Paperclip, Sparkles, X } from "lucide-react";
-import { suggestedPrompts } from "../data/demoData";
+import { suggestedPrompts } from "../data/prompts";
+import { detectApprovalIntent } from "../services/approvalsApi";
 import type { AgentStep } from "../types";
 import AgentTimeline from "./AgentTimeline";
 import Button from "./Button";
 import { useMsal } from "@azure/msal-react";
 import { ApiError } from "../services/environmentApi";
-import { FabricAuthError, getFabricToken } from "../services/fabricAuth";
+import { FabricAuthError, getFabricToken, getSqlEndpointToken } from "../services/fabricAuth";
 import {
   cancelJob,
   describeError,
@@ -15,7 +16,8 @@ import {
   getJobResults,
   isTerminal,
   MAX_UPLOAD_MB,
-  resolveConnectionId,
+  resolveExecutionTarget,
+  SESSION_EXPIRED_MESSAGE,
   startAnalysis,
   STATUS_LABELS,
   uploadClusterFile,
@@ -61,6 +63,8 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
   const [file, setFile] = useState<File | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const poller = useRef<number | null>(null);
+  // Whether the current run's environment uses delegated (Microsoft Account) auth.
+  const delegated = useRef(false);
 
   useEffect(() => {
     return () => stopPolling();
@@ -90,6 +94,21 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
     }
   }
 
+  /**
+   * A fresh delegated Fabric token, or a clean "sign in again" error.
+   * getFabricToken() renews silently and only prompts when MSAL requires it.
+   */
+  async function requireDelegatedToken(): Promise<string> {
+    try {
+      const token = await getFabricToken(instance);
+      if (token) return token;
+    } catch (e: unknown) {
+      if (!(e instanceof FabricAuthError)) throw e;
+      if (e.code === "CONSENT_REQUIRED") throw new ApiError(e.message, 401);
+    }
+    throw new ApiError(SESSION_EXPIRED_MESSAGE, 401);
+  }
+
   function stopPolling() {
     if (poller.current) {
       window.clearInterval(poller.current);
@@ -103,6 +122,21 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
     if (!trimmed || runState === "starting" || runState === "running") return;
     if (file && !text.trim()) setPrompt(trimmed);
 
+    // Approval requests go to the Approvals UI — checked BEFORE analysis routing,
+    // since "pending cluster approvals" must not start a cluster run. The agent
+    // never approves or rejects by itself: it opens the confirmation workflow.
+    const intent = file ? null : detectApprovalIntent(trimmed);
+    if (intent) {
+      navigate(
+        intent.kind === "list"
+          ? `/approvals?status=${intent.status}`
+          : `/approvals?cluster=${encodeURIComponent(intent.cluster)}${
+              intent.kind === "review" ? "" : `&action=${intent.kind}`
+            }`
+      );
+      return;
+    }
+
     stopPolling();
     setError(null);
     setUploadError(null);
@@ -113,9 +147,18 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
     try {
       // A request with an uploaded file always takes the file-analysis path:
       // no Fabric/Databricks connection or token is needed.
-      const started = file
-        ? await uploadClusterFile(file, trimmed)
-        : await startAnalysis(trimmed, await resolveConnectionId(), await fabricToken());
+      let started: AnalysisJob;
+      if (file) {
+        started = await uploadClusterFile(file, trimmed);
+      } else {
+        const target = await resolveExecutionTarget();
+        delegated.current = target.delegated;
+        // Delegated environments authenticate ONLY with the user's own token, so
+        // a fresh one is required on every submission. Without it the request is
+        // never sent — the backend has no other credential to use.
+        const token = target.delegated ? await requireDelegatedToken() : await fabricToken();
+        started = await startAnalysis(trimmed, target.connectionId, token);
+      }
       setJob(started);
 
       if (isTerminal(started)) {
@@ -134,7 +177,11 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
 
   async function poll(jobId: string) {
     try {
-      const latest = await getJob(jobId, await fabricToken());
+      const token = await fabricToken();
+      // A delegated poll without a token would authenticate as nobody and could
+      // fail a healthy run. Skip this tick; the next one retries.
+      if (delegated.current && !token) return;
+      const latest = await getJob(jobId, token);
       setJob(latest);
       if (isTerminal(latest)) {
         stopPolling();
@@ -154,7 +201,10 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
   async function finish(jobId: string) {
     setRunState("done");
     try {
-      setResults(await getJobResults(jobId, await fabricToken()));
+      // Delegated environments read the result table as the user, which needs a
+      // token for the Lakehouse SQL endpoint in addition to the Fabric one.
+      const sqlToken = delegated.current ? await getSqlEndpointToken(instance) : null;
+      setResults(await getJobResults(jobId, await fabricToken(), sqlToken));
     } catch {
       // Results genuinely unavailable — the run panel reports that honestly.
       setResults([]);
@@ -389,11 +439,18 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
                           {run.domain} — {STATUS_LABELS[run.status] ?? run.status}
                         </p>
 
+                        {/* Only ever the id the platform returned; never generated here. */}
                         {run.platform_run_id && (
-                          <p className="mt-1 break-all font-mono text-[11px] text-ink-faint">
-                            run {run.platform_run_id}
+                          <p className="mt-1 break-all text-[11px] text-ink-faint">
+                            {job.platform === "fabric" ? "Fabric Run ID" : "Platform run"}:{" "}
+                            <span data-testid="platform-run-id" className="font-mono">
+                              {run.platform_run_id}
+                            </span>
                           </p>
                         )}
+                        <p className="mt-0.5 break-all text-[11px] text-ink-faint">
+                          ACELO run: <span className="font-mono">{run.id}</span>
+                        </p>
 
                         {run.error_code && (
                           <p className="mt-1 text-xs text-signal-high">
@@ -407,9 +464,18 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
                             {String((result.payload as any)?.row_count ?? 0)} result rows
                           </p>
                         )}
+                        {result?.available && (result.payload as any)?.parameter_verification && (
+                          <p data-testid="parameter-verification" className="mt-1 text-xs text-ink-muted">
+                            Notebook parameters:{" "}
+                            {String((result.payload as any).parameter_verification.status)}
+                          </p>
+                        )}
                         {run.status === "COMPLETED" && result && !result.available && (
                           <p className="mt-1 text-xs text-signal-medium">
-                            {describeError(result.error_code, "Results are not available for this run.")}
+                            {describeError(
+                              result.error_code,
+                              result.error ?? "Results are not available for this run."
+                            )}
                           </p>
                         )}
                       </div>
@@ -417,19 +483,14 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
                   })}
                 </div>
 
-                {results.some((r) => r.available) &&
-                  (job.platform === "file" ? (
-                    <Button
-                      className="mt-5 w-full"
-                      onClick={() => navigate(`/results?job=${job.id}`)}
-                    >
-                      View Results
-                    </Button>
-                  ) : (
-                    <Button className="mt-5 w-full" onClick={() => navigate("/optimizations")}>
-                      View Recommendations
-                    </Button>
-                  ))}
+                {results.some((r) => r.available && r.domain === "cluster") && (
+                  <Button
+                    className="mt-5 w-full"
+                    onClick={() => navigate(`/results?job=${job.id}`)}
+                  >
+                    View Results
+                  </Button>
+                )}
               </div>
             )}
           </div>

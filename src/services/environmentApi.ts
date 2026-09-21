@@ -235,6 +235,25 @@ export interface ProvisioningState {
   error_code: string | null;
   message: string | null;
   missing_assets: string[];
+  /** Lakehouse the notebook is attached to; null means Spark table access will fail. */
+  default_lakehouse?: { id: string; name: string; workspace_id: string; source?: string } | null;
+  /** The default Lakehouse the deployed notebook was READ BACK as carrying. */
+  lakehouse_binding?: {
+    status: "VERIFIED" | "MISMATCH" | "MISSING" | "UNVERIFIED";
+    bound_id?: string | null;
+    bound_name?: string | null;
+    reason?: string;
+  } | null;
+  /** Fabric Environment providing the notebook's libraries; null = workspace default. */
+  fabric_environment?: { id: string; name: string; workspace_id: string; source: string } | null;
+  execution_type?: string;
+  pipeline?: {
+    name: string;
+    platform_resource_id: string | null;
+    ready: boolean;
+    error_code: string | null;
+    message: string | null;
+  } | null;
 }
 
 export interface Readiness2 extends Readiness {
@@ -268,4 +287,117 @@ export function getProvisioningStatus(id: string): Promise<ProvisioningState> {
 
 export function getReadiness2(id: string): Promise<Readiness2> {
   return request<Readiness2>(`/environments/${id}/readiness`);
+}
+
+export function getEnvironment(id: string): Promise<Environment> {
+  return request<Environment>(`/environments/${id}`);
+}
+
+interface PersistedResources {
+  environment_id: string;
+  counts: Record<string, number>;
+  resources: { platform_resource_id: string; display_name: string; resource_type: string }[];
+}
+
+/**
+ * The result of the LAST successful discovery, as persisted by the backend.
+ * Lets the page show "Discovery complete" after a reload without re-running it.
+ */
+export async function getPersistedDiscovery(env: Environment): Promise<DiscoveryResult | null> {
+  if (!env.last_discovered_at) return null;
+  const data = await request<PersistedResources>(`/environments/${env.id}/resources`);
+  return {
+    discovered: true,
+    workspace:
+      env.workspace_id && env.workspace_name ? { id: env.workspace_id, name: env.workspace_name } : null,
+    items: data.resources.map((r) => ({
+      id: r.platform_resource_id,
+      display_name: r.display_name,
+      type: r.resource_type,
+    })),
+    counts: data.counts,
+    discovered_at: env.last_discovered_at,
+  };
+}
+
+/** Non-secret settings the Cluster notebook needs (tables, lakehouse, SQL endpoint). */
+export interface ClusterSettings {
+  source_table: string;
+  result_table: string;
+  source_lakehouse: string;
+  result_lakehouse: string;
+  lakehouse_database: string;
+  sql_endpoint: string;
+  column_mapping: string;
+  /** Fabric Environment (Spark libraries, e.g. xgboost) attached to the notebook. */
+  fabric_environment_id: string;
+  /** "notebook" (direct) or "pipeline" (a Fabric Data Pipeline). */
+  execution_type: string;
+  /** Schema of a schema-enabled Lakehouse (e.g. "dbo"): tables resolve to dbo.<table>. */
+  source_schema: string;
+  result_schema: string;
+  /** The pipeline to run when execution_type is "pipeline"; blank = ACELO's pipeline. */
+  pipeline_id: string;
+  /** Lakehouse item bound as the notebook's DEFAULT Lakehouse (needed when discovery can't see it). */
+  lakehouse_id: string;
+  /** Workspace of that Lakehouse, if different from this environment's. */
+  lakehouse_workspace_id: string;
+  /** Delta table ACELO reads approval candidates from (e.g. cluster_optimization_tracking). */
+  approval_tracking_table: string;
+}
+
+/** A Fabric pipeline known to this environment (discovered or ACELO-deployed). */
+export interface WorkspacePipeline {
+  id: string;
+  name: string;
+  managed: boolean;
+}
+
+/** The execution path the backend will ACTUALLY use for a Cluster run. */
+export interface ClusterExecution {
+  execution_type: "notebook" | "pipeline";
+  pipeline: { id: string; name: string | null; source: "configured" | "acelo-managed" } | null;
+}
+
+export interface ClusterSettingsState {
+  settings: ClusterSettings;
+  /** Required settings still missing; empty when Cluster is configured. */
+  missing: string[];
+  execution?: ClusterExecution;
+  pipelines?: WorkspacePipeline[];
+}
+
+/** As the API returns them: anything not configured is null, never "" or a sample. */
+type StoredClusterSettings = { [K in keyof ClusterSettings]: string | null };
+
+function fromStored(settings: StoredClusterSettings): ClusterSettings {
+  const out = {} as ClusterSettings;
+  (Object.keys(settings) as (keyof ClusterSettings)[]).forEach((k) => {
+    out[k] = settings[k] ?? "";
+  });
+  return out;
+}
+
+async function clusterSettingsRequest(path: string, options?: RequestInit): Promise<ClusterSettingsState> {
+  const raw = await request<Omit<ClusterSettingsState, "settings"> & { settings: StoredClusterSettings }>(
+    path,
+    options
+  );
+  return { ...raw, settings: fromStored(raw.settings) };
+}
+
+export function getClusterSettings(id: string): Promise<ClusterSettingsState> {
+  return clusterSettingsRequest(`/environments/${id}/cluster-settings`);
+}
+
+export function saveClusterSettings(
+  id: string,
+  settings: Partial<ClusterSettings>
+): Promise<ClusterSettingsState> {
+  // Blank means "not configured": sent as "" so the backend removes the value
+  // (it then reads back as null). Nothing is ever defaulted to a sample.
+  return clusterSettingsRequest(`/environments/${id}/cluster-settings`, {
+    method: "PUT",
+    body: JSON.stringify(settings),
+  });
 }
