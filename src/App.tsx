@@ -11,9 +11,13 @@ import Execution from "./pages/Execution";
 import Results from "./pages/Results";
 import History from "./pages/History";
 import Settings from "./pages/Settings";
+import RunDetails from "./pages/RunDetails";
+import { RunMonitorProvider } from "./components/RunMonitor";
 
 export default function App() {
+  // The run monitor wraps every route so run notifications appear on any page.
   return (
+    <RunMonitorProvider>
     <Routes>
       <Route path="/" element={<Overview />} />
       <Route path="/agent" element={<AIAgent />} />
@@ -26,8 +30,11 @@ export default function App() {
       <Route path="/execution" element={<Execution />} />
       <Route path="/results" element={<Results />} />
       <Route path="/history" element={<History />} />
+      <Route path="/runs" element={<History />} />
+      <Route path="/runs/:id" element={<RunDetails />} />
       <Route path="/settings" element={<Settings />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
+    </RunMonitorProvider>
   );
 }

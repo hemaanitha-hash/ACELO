@@ -116,7 +116,7 @@ describe("AI Agent -> Fabric Cluster run", () => {
     renderAgent();
     await submit(user);
 
-    expect(exec.startAnalysis).toHaveBeenCalledWith("Check my cluster utilization", "conn-1", "DELEGATED-TOKEN");
+    expect(exec.startAnalysis).toHaveBeenCalledWith("Check my cluster utilization", "conn-1", "DELEGATED-TOKEN", expect.anything());
     expect(exec.uploadClusterFile).not.toHaveBeenCalled();
   });
 
@@ -264,7 +264,7 @@ describe("delegated Fabric authentication on every execution", () => {
     await submit(user);
 
     await screen.findByText("cluster — Starting");
-    expect(exec.startAnalysis).toHaveBeenCalledWith("Check my cluster utilization", "conn-sp", null);
+    expect(exec.startAnalysis).toHaveBeenCalledWith("Check my cluster utilization", "conn-sp", null, expect.anything());
   });
 });
 
@@ -275,7 +275,7 @@ describe("delegated result read", () => {
     renderAgent();
     await submit(user);
     await screen.findByText("cluster — Completed");
-    expect(exec.getJobResults).toHaveBeenCalledWith("job-1", "DELEGATED-TOKEN", "SQL-ENDPOINT-TOKEN");
+    expect(exec.getJobResults).toHaveBeenCalledWith("job-1", "DELEGATED-TOKEN", "SQL-ENDPOINT-TOKEN", null);
   });
 
   it("service-principal environments never request a SQL token", async () => {
@@ -286,7 +286,7 @@ describe("delegated result read", () => {
     await submit(user);
     await screen.findByText("cluster — Completed");
     expect(sqlTokenMock).not.toHaveBeenCalled();
-    expect(exec.getJobResults).toHaveBeenCalledWith("job-1", "DELEGATED-TOKEN", null);
+    expect(exec.getJobResults).toHaveBeenCalledWith("job-1", "DELEGATED-TOKEN", null, null);
   });
 });
 

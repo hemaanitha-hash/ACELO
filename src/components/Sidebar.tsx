@@ -22,7 +22,7 @@ const navItems = [
   { to: "/recommendations", label: "Recommendations", icon: FileText },
   { to: "/approvals", label: "Approvals", icon: ShieldCheck, badge: 3 },
   { to: "/execution", label: "Execution", icon: PlayCircle },
-  { to: "/history", label: "History", icon: History },
+  { to: "/history", label: "Run History", icon: History },
 ];
 
 const platforms = [

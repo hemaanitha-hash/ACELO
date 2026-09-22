@@ -8,7 +8,7 @@ import AgentTimeline from "./AgentTimeline";
 import Button from "./Button";
 import { useMsal } from "@azure/msal-react";
 import { ApiError } from "../services/environmentApi";
-import { FabricAuthError, getFabricToken, getSqlEndpointToken } from "../services/fabricAuth";
+import { FabricAuthError, getFabricToken, getOneLakeToken, getSqlEndpointToken } from "../services/fabricAuth";
 import {
   cancelJob,
   describeError,
@@ -39,6 +39,30 @@ type RunState = "idle" | "starting" | "running" | "done" | "error";
 
 const POLL_INTERVAL_MS = 3000;
 
+/**
+ * The last job this tab started. Leaving the Agent never cancels a run (the
+ * backend owns it); on return the Agent reloads the run from the backend.
+ * Per-viewer convenience only — the run itself lives in Run History.
+ */
+const LAST_JOB_KEY = "acelo.agent.lastJobId";
+
+function rememberJob(id: string | null) {
+  try {
+    if (id) window.sessionStorage.setItem(LAST_JOB_KEY, id);
+    else window.sessionStorage.removeItem(LAST_JOB_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function lastJob(): string | null {
+  try {
+    return window.sessionStorage.getItem(LAST_JOB_KEY);
+  } catch {
+    return null;
+  }
+}
+
 /** Requests that make sense for an uploaded Cluster dataset. */
 const FILE_PROMPTS = [
   "Analyze this cluster file",
@@ -66,14 +90,35 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
   // Whether the current run's environment uses delegated (Microsoft Account) auth.
   const delegated = useRef(false);
 
+  // Unmount only stops this view polling; it never cancels the backend run.
   useEffect(() => {
     return () => stopPolling();
   }, []);
 
   useEffect(() => {
     if (initialPrompt) startRun(initialPrompt);
+    else void restoreLastRun();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /** Coming back to the Agent: show the latest state of the run started here. */
+  async function restoreLastRun() {
+    const jobId = lastJob();
+    if (!jobId) return;
+    try {
+      const latest = await getJob(jobId, await fabricToken());
+      delegated.current = latest.platform === "fabric" && !!instance.getActiveAccount();
+      setJob(latest);
+      if (isTerminal(latest)) {
+        await finish(jobId);
+      } else {
+        setRunState("running");
+        poller.current = window.setInterval(() => void poll(jobId), POLL_INTERVAL_MS);
+      }
+    } catch {
+      rememberJob(null);
+    }
+  }
 
   /**
    * Delegated Fabric token for this request.
@@ -157,9 +202,17 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
         // a fresh one is required on every submission. Without it the request is
         // never sent — the backend has no other credential to use.
         const token = target.delegated ? await requireDelegatedToken() : await fabricToken();
-        started = await startAnalysis(trimmed, target.connectionId, token);
+        // Given to the backend so IT can read results from OneLake when the run
+        // finishes, whether or not this tab is still open.
+        const onelake = target.delegated ? await getOneLakeToken(instance).catch(() => null) : null;
+        const account = instance.getActiveAccount() ?? instance.getAllAccounts()[0];
+        started = await startAnalysis(trimmed, target.connectionId, token, {
+          onelakeToken: onelake,
+          userName: account ? account.name ?? account.username : null,
+        });
       }
       setJob(started);
+      rememberJob(started.id);
 
       if (isTerminal(started)) {
         await finish(started.id);
@@ -204,7 +257,8 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
       // Delegated environments read the result table as the user, which needs a
       // token for the Lakehouse SQL endpoint in addition to the Fabric one.
       const sqlToken = delegated.current ? await getSqlEndpointToken(instance) : null;
-      setResults(await getJobResults(jobId, await fabricToken(), sqlToken));
+      const onelake = delegated.current ? await getOneLakeToken(instance).catch(() => null) : null;
+      setResults(await getJobResults(jobId, await fabricToken(), sqlToken, onelake));
     } catch {
       // Results genuinely unavailable — the run panel reports that honestly.
       setResults([]);
@@ -222,6 +276,7 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
 
   function reset() {
     stopPolling();
+    rememberJob(null);
     setPrompt("");
     setRunState("idle");
     setJob(null);
@@ -449,7 +504,13 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
                           </p>
                         )}
                         <p className="mt-0.5 break-all text-[11px] text-ink-faint">
-                          ACELO run: <span className="font-mono">{run.id}</span>
+                          ACELO run: <span className="font-mono">{run.id}</span>{" "}
+                          <button
+                            onClick={() => navigate(`/runs/${run.id}`)}
+                            className="ml-1 text-[#D71920] hover:underline"
+                          >
+                            View run details
+                          </button>
                         </p>
 
                         {run.error_code && (

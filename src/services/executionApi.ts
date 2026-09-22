@@ -223,11 +223,18 @@ export async function resolveExecutionTarget(): Promise<ExecutionTarget> {
 export async function startAnalysis(
   prompt: string,
   connectionId: string,
-  token?: string | null
+  token?: string | null,
+  extra?: { onelakeToken?: string | null; userName?: string | null }
 ): Promise<AnalysisJob> {
+  // The OneLake token lets the backend read results itself when the run
+  // finishes — even if this tab is closed. Held in backend memory only.
   return request<AnalysisJob>("/jobs", {
     method: "POST",
-    headers: fabricTokenHeader(token),
+    headers: {
+      ...fabricTokenHeader(token),
+      ...(extra?.onelakeToken ? { "X-OneLake-Token": extra.onelakeToken } : {}),
+      ...(extra?.userName ? { "X-Acelo-User-Name": extra.userName } : {}),
+    },
     body: JSON.stringify({ connection_id: connectionId, prompt }),
   });
 }
@@ -251,12 +258,14 @@ export function getJob(jobId: string, token?: string | null): Promise<AnalysisJo
 export function getJobResults(
   jobId: string,
   token?: string | null,
-  sqlToken?: string | null
+  sqlToken?: string | null,
+  onelakeToken?: string | null
 ): Promise<JobResult[]> {
   return request<JobResult[]>(`/jobs/${jobId}/results`, {
     headers: {
       ...fabricTokenHeader(token),
       ...(sqlToken ? { "X-Fabric-Sql-Token": sqlToken } : {}),
+      ...(onelakeToken ? { "X-OneLake-Token": onelakeToken } : {}),
     },
   });
 }

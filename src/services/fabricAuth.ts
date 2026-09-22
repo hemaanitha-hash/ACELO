@@ -234,3 +234,24 @@ export async function getOneLakeToken(instance: IPublicClientApplication): Promi
     }
   }
 }
+
+/**
+ * Silent-only tokens for background work (the global run monitor). Never
+ * shows a popup: a background poll must not interrupt the user. Null when a
+ * token cannot be obtained silently — the backend worker keeps monitoring
+ * with the tokens it was given at submission.
+ */
+export async function getSilentRunTokens(
+  instance: IPublicClientApplication
+): Promise<{ fabric: string | null; onelake: string | null }> {
+  const account = instance.getActiveAccount() ?? instance.getAllAccounts()[0];
+  if (!account) return { fabric: null, onelake: null };
+  const silent = async (scopes: string[]) => {
+    try {
+      return (await instance.acquireTokenSilent({ scopes, account })).accessToken;
+    } catch {
+      return null;
+    }
+  };
+  return { fabric: await silent(FABRIC_SCOPES), onelake: await silent(ONELAKE_SCOPES) };
+}
