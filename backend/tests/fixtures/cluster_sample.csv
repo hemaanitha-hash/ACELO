@@ -1,0 +1,13 @@
+cluster_id,cluster_name,node_type,current_workers,min_workers,max_workers,avg_cpu_util,avg_memory_util,idle_time_min,cluster_uptime_hours,total_jobs_run,total_dbus_cost_usd,owner_team
+c-001,analytics-adhoc,Standard_DS4_v2,8,2,10,12.5,20.1,2400,120,40,5200.50,analytics
+c-002,ml-training-gpu,Standard_DS5_v2,6,2,8,78.2,81.0,120,200,900,8400.00,ml
+c-003,etl-nightly,Standard_DS3_v2,4,2,6,55.0,60.3,300,90,450,1900.25,data-eng
+c-004,bi-dashboards,Standard_DS3_v2,6,1,8,18.4,25.7,1800,150,60,3100.00,bi
+c-005,dev-sandbox,Standard_DS3_v2,4,1,4,6.1,11.2,4200,160,12,2250.75,platform
+c-006,stream-ingest,Standard_DS4_v2,5,3,8,42.0,48.5,90,720,3000,6100.00,data-eng
+c-007,reporting-weekly,Standard_DS4_v2,10,2,12,22.3,30.0,2600,110,85,4700.00,finance
+c-008,feature-store,Standard_DS4_v2,4,2,6,64.8,70.1,200,300,1200,3350.40,ml
+c-009,qa-integration,Standard_DS3_v2,3,1,4,15.0,19.9,1500,60,30,780.00,qa
+c-010,new-poc-cluster,Standard_DS3_v2,2,1,4,5.0,9.0,20,0.5,1,15.00,research
+c-011,finance-close,Standard_DS5_v2,12,4,16,35.6,44.2,1100,140,260,9800.00,finance
+c-012,marketing-attribution,Standard_DS4_v2,6,2,8,28.9,33.4,1300,130,140,3900.00,marketing

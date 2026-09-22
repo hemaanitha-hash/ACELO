@@ -1,8 +1,26 @@
+# Frontend
 node_modules/
 dist/
-*.tsbuildinfo
+tsconfig.tsbuildinfo
 
-# Local environment configuration. .env.example is committed; .env is not.
+# Environment / secrets
 .env
 .env.local
 .env.*.local
+
+# Backend Python
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+
+# Backend environment / secrets
+backend/.env
+
+# Local databases
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+
+# Python cache
+*.pyc
