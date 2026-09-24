@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import Layout from "../components/Layout";
+import PageHeader from "../components/PageHeader";
+import { StatePanel } from "../components/StateBlock";
 import FilterBar from "../components/FilterBar";
 import OpportunityTable from "../components/OpportunityTable";
 import { getOptimizations } from "../services/api";
@@ -44,12 +46,10 @@ export default function Optimizations() {
   return (
     <Layout pageName="Optimizations" onRefresh={load}>
       <div className="flex flex-col gap-6">
-        <div>
-          <h1 className="text-display font-semibold text-ink">Optimization opportunities</h1>
-          <p className="mt-2 text-sm text-ink-muted">
-            AI-detected opportunities across Query, Cluster and Storage.
-          </p>
-        </div>
+        <PageHeader
+          title="Optimization opportunities"
+          description="AI-detected opportunities across Query, Cluster and Storage."
+        />
 
         <FilterBar
           tabs={domainTabs}
@@ -85,7 +85,7 @@ export default function Optimizations() {
         />
 
         {loading ? (
-          <div className="surface py-16 text-center text-sm text-ink-muted">Loading opportunities...</div>
+          <StatePanel kind="loading" title="Loading opportunities…" />
         ) : (
           <OpportunityTable opportunities={filtered} />
         )}

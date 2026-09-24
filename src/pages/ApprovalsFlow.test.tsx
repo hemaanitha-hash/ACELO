@@ -18,6 +18,7 @@ const { api, msal } = vi.hoisted(() => ({
     reject: vi.fn(),
     execute: vi.fn(),
     refreshFromTracking: vi.fn(),
+    reopen: vi.fn(),
   },
   msal: {
     instance: {
@@ -46,7 +47,7 @@ vi.mock("../services/api", async () => {
   const actual = await vi.importActual<typeof import("../services/api")>("../services/api");
   return {
     ...actual,
-    getOverview: vi.fn(async () => ({
+    getOverview: vi.fn(async (): Promise<any> => ({
       userName: "", kpis: { monthlyCost: 0, potentialSavings: 0, openOpportunities: 0, optimizationHealth: null },
       health: [], lastAnalysisMinutesAgo: null, platformConnected: null, priorityOpportunities: [], hasData: false,
     })),
@@ -57,6 +58,17 @@ import Approvals from "./Approvals";
 import ApprovalDetail from "./ApprovalDetail";
 import Overview from "./Overview";
 import { ApiError } from "../services/environmentApi";
+
+// This suite covers the legacy multi-platform experience (Fabric, the platform
+// switcher, multiple environments). Databricks-only is the default for the MVP,
+// so the legacy experience is selected explicitly here.
+vi.mock("../services/experience", async () => {
+  const actual = await vi.importActual<typeof import("../services/experience")>(
+    "../services/experience"
+  );
+  return { ...actual, isDatabricksOnly: () => false };
+});
+
 
 function approval(overrides: Record<string, unknown> = {}) {
   return {
@@ -109,17 +121,17 @@ describe("Approvals list", () => {
     expect(api.listApprovals).toHaveBeenCalledWith({ status: ["PENDING"] });
   });
 
-  it("empty state is 'No pending approvals.' — no dummy rows", async () => {
+  it("empty state is 'No pending approvals' — no dummy rows", async () => {
     api.listApprovals.mockResolvedValue([]);
     renderAt("/approvals");
-    expect(await screen.findByText("No pending approvals.")).toBeInTheDocument();
+    expect(await screen.findByText("No pending approvals")).toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
   });
 
   it("load failure says so instead of showing data", async () => {
     api.listApprovals.mockRejectedValue(new ApiError("backend down", 500));
     renderAt("/approvals");
-    expect(await screen.findByText("Unable to load optimization recommendations.")).toBeInTheDocument();
+    expect(await screen.findByText("Unable to load optimization recommendations")).toBeInTheDocument();
   });
 
   it("missing values read 'Not available'; a real 0 stays 0", async () => {
@@ -258,8 +270,15 @@ describe("AI Agent deep links never act silently", () => {
 });
 
 describe("Dashboard approval KPIs", () => {
-  it("come from the real summary and link to Approvals", async () => {
+  it("come from the real query summary and link to Approvals", async () => {
     const user = userEvent.setup();
+    const { getOverview } = await import("../services/api");
+    (getOverview as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      userName: "", kpis: { monthlyCost: null, potentialSavings: null, openOpportunities: 3, optimizationHealth: null },
+      health: [], lastAnalysisMinutesAgo: null, platformConnected: null, priorityOpportunities: [], hasData: true,
+      query: { unhealthyQueries: 5, optimizationOpportunities: 3, approvalItems: 3, byStatus: SUMMARY,
+               potentialSavings: null, latestRun: null },
+    });
     renderAt("/");
     await waitFor(() => expect(screen.getByTestId("approval-kpi-PENDING")).toHaveTextContent("1"));
     expect(screen.getByTestId("approval-kpi-REJECTED")).toHaveTextContent("2");
@@ -286,12 +305,12 @@ describe("Approvals read from the Fabric tracking Delta table (OneLake, no SQL e
   it("refreshes from the tracking table with the OneLake token on load", async () => {
     api.refreshFromTracking.mockResolvedValue({
       sources: [{ environment_id: "env-9", table: "cluster_optimization_tracking", status: "ok",
-                  rows_read: 3, candidates: 2, created: 2 }],
+                  rows_read: 3, candidates: 2, unique_business_keys: 2, created: 1, updated: 1 }],
       summary: SUMMARY,
     });
     renderAt("/approvals");
     expect(await screen.findByTestId("tracking-ok")).toHaveTextContent(
-      "Read 3 rows from cluster_optimization_tracking · 2 new"
+      "Read 3 rows from cluster_optimization_tracking · 2 clusters · 1 new · 1 updated"
     );
     expect(api.refreshFromTracking).toHaveBeenCalledWith("FABRIC-TOKEN", "ONELAKE-TOKEN");
     // The list shown is what the backend persisted after the import.
@@ -310,7 +329,7 @@ describe("Approvals read from the Fabric tracking Delta table (OneLake, no SQL e
     const error = await screen.findByTestId("tracking-error");
     expect(error).toHaveTextContent("Unable to load optimization recommendations from the approval tracking table.");
     expect(error).toHaveTextContent("was not found in the Lakehouse");
-    expect(await screen.findByText("No pending approvals.")).toBeInTheDocument();
+    expect(await screen.findByText("No pending approvals")).toBeInTheDocument();
   });
 
   it("an unconfigured tracking table is reported, not faked", async () => {
@@ -333,5 +352,89 @@ describe("Approvals read from the Fabric tracking Delta table (OneLake, no SQL e
       "Microsoft Fabric · approval tracking table"
     );
     expect(screen.getByText("ACELO Run ID", { selector: "dt" }).parentElement).toHaveTextContent("run-from-delta");
+  });
+});
+
+
+describe("current state vs history", () => {
+  it("a decided cluster with a newer recommendation keeps its decision until explicitly re-reviewed", async () => {
+    const decided = approval({
+      status: "APPROVED", approved_by: "Priya Reviewer", requires_new_approval: true,
+      latest_recommendation: { optimization_label: "Risky", current_workers: 16, recommended_max_workers: 4,
+        total_dbus_cost_usd: 2000, potential_monthly_savings: 900, llm_optimization: "x", run_id: "run-88" },
+    });
+    api.getApproval.mockResolvedValue(decided);
+    api.reopen.mockResolvedValue(approval({ status: "PENDING", potential_monthly_savings: 900, requires_new_approval: false,
+      latest_recommendation: null }));
+    renderAt("/approvals/ap-1");
+    const banner = await screen.findByTestId("new-recommendation");
+    expect(banner).toHaveTextContent("approved decision still applies");
+    expect(banner).toHaveTextContent("$900.00");
+    await userEvent.click(within(banner).getByRole("button", { name: "Review new recommendation" }));
+    await waitFor(() => expect(api.reopen).toHaveBeenCalledWith("ap-1", expect.objectContaining({ userName: "Priya Reviewer" })));
+    expect(await screen.findByRole("button", { name: "Approve" })).toBeInTheDocument();
+    expect(screen.queryByTestId("new-recommendation")).not.toBeInTheDocument();
+  });
+
+  it("overview keeps cluster and query apart, and shows unknown values as Not available", async () => {
+    const { getOverview } = await import("../services/api");
+    (getOverview as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      userName: "", kpis: { monthlyCost: 1000, potentialSavings: 300, openOpportunities: 120, optimizationHealth: null },
+      health: [], lastAnalysisMinutesAgo: 3, platformConnected: "Microsoft Fabric", priorityOpportunities: [], hasData: true,
+      cluster: { clustersAnalyzed: 117, risky: 40, moderatelyOptimized: 60, optimized: 17, potentialSavings: 300,
+                 monthlyCost: 1000, latestRun: { acelo_run_id: "run-2", platform_run_id: "13d76c9c", status: "COMPLETED",
+                                                 completed_at: null } },
+      query: { unhealthyQueries: null, optimizationOpportunities: null, approvalItems: 3,
+               byStatus: { ...SUMMARY, PENDING: 3, REJECTED: 0 }, potentialSavings: null, latestRun: null },
+      executions: { total: 2, succeeded: 2, failed: 0, cancelled: 0, active: 0 },
+    });
+    renderAt("/");
+    const cluster = await screen.findByTestId("cluster-metrics");
+    await waitFor(() => expect(cluster).toHaveTextContent("Clusters analyzed117"));
+    expect(cluster).toHaveTextContent("Risky40");
+    expect(cluster).toHaveTextContent("Last run ID: 13d76c9c");
+    const query = screen.getByTestId("query-metrics");
+    expect(query).toHaveTextContent("Unhealthy queriesNot available");
+    // 117 clusters never inflate the query approval counts.
+    expect(screen.getByTestId("approval-kpi-PENDING")).toHaveTextContent("3");
+    expect(screen.getByTestId("execution-metrics")).toHaveTextContent("Runs2");
+  });
+
+});
+
+describe("query approval review", () => {
+  it("shows original SQL, optimized SQL, validation evidence and performance from the real record", async () => {
+    api.getApproval.mockResolvedValue(approval({
+      domain: "query", resource_id: "q-42", resource_name: "q-42", optimization_label: "DISK_SPILL",
+      original_sql: "SELECT * FROM sales", optimized_sql: "SELECT id FROM sales",
+      platform_validation_status: "verified", total_dbus_cost_usd: 9.5, potential_monthly_savings: 3.25,
+      llm_optimization: "Reduce intermediate data around joins.",
+      evidence: { savings_percentage: 41.5, original_duration_seconds: 12.3, optimized_duration_seconds: 7.1,
+                  original_cost_usd: 0.0068, optimized_cost_usd: 0.0039, validation_schema_match: true,
+                  validation_row_count_match: true, execution_time_ms: 9000, cpu_time_ms: 7000,
+                  bytes_scanned: 5368709120, bytes_spilled: 0, shuffle_bytes: 1048576, root_cause: "Large shuffle join" },
+    }));
+    renderAt("/approvals/ap-1");
+    expect(await screen.findByText("Query q-42")).toBeInTheDocument();
+    expect(screen.getByTestId("original-sql")).toHaveTextContent("SELECT * FROM sales");
+    expect(screen.getByTestId("optimized-sql")).toHaveTextContent("SELECT id FROM sales");
+    const evidence = screen.getByTestId("validation-evidence");
+    expect(evidence).toHaveTextContent("12.30 s");
+    expect(evidence).toHaveTextContent("7.10 s");
+    expect(evidence).toHaveTextContent("Schema matchYes");
+    expect(screen.getByText("5.00 GB")).toBeInTheDocument();
+    expect(screen.getByText("0 B")).toBeInTheDocument(); // a real 0 stays 0
+    expect(screen.getByText("41.50%")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeInTheDocument();
+  });
+
+  it("missing metrics are Not available, never 0", async () => {
+    api.getApproval.mockResolvedValue(approval({ domain: "query", resource_name: "q-7", evidence: {},
+      original_sql: null, optimized_sql: null, platform_validation_status: "review_required" }));
+    renderAt("/approvals/ap-1");
+    const evidence = await screen.findByTestId("validation-evidence");
+    expect(evidence).toHaveTextContent("Original execution timeNot available");
+    expect(screen.getByTestId("original-sql")).toHaveTextContent("Not available");
   });
 });

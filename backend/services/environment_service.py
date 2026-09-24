@@ -257,14 +257,9 @@ def build_adapter(
     # serves which domain. Registered Fabric item IDs override anything left in
     # the connection's legacy auth_metadata, so no notebook ID is ever hardcoded.
     # Imported here to avoid a circular import at module load.
-    from services.provisioning_service import resolved_domains, resolved_pipelines, result_location
+    from services import resource_registry
 
-    for domain, item_id in resolved_domains(db, environment).items():
-        auth_metadata[f"{domain}_notebook_id"] = item_id
-    for key, value in result_location(db, environment).items():
-        auth_metadata.setdefault(key, value)  # OneLake result reads
-    for domain, item_id in resolved_pipelines(db, environment).items():
-        auth_metadata.setdefault(f"{domain}_pipeline_id", item_id)  # a configured pipeline wins
+    resource_registry.apply_to_adapter(db, environment, auth_metadata)
 
     adapter = adapter_cls(endpoint=endpoint, auth_metadata=auth_metadata, secret=secret)
 
@@ -459,6 +454,11 @@ async def discover_environment(
             for item in discovered
         ],
         "counts": summarize_counts(discovered),
+        # Per-resource-type outcome, where the adapter reports one. This is what
+        # lets the UI distinguish "this type returned zero" from "this type
+        # could not be read" — without it, a refused or unsupported endpoint
+        # renders identically to an empty workspace.
+        "resource_states": getattr(adapter, "last_discovery_states", []) or [],
         "discovered_at": environment.last_discovered_at.isoformat(),
     }
 

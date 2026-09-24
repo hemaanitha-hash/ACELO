@@ -36,11 +36,19 @@ export interface DomainHealth {
 }
 
 export interface OverviewKpis {
-  monthlyCost: number;
-  potentialSavings: number;
-  openOpportunities: number;
+  /** null = unknown (shown as "Not available"), never a fabricated 0. */
+  monthlyCost: number | null;
+  potentialSavings: number | null;
+  openOpportunities: number | null;
   /** null until real analysis data exists. Never substituted with a demo value. */
   optimizationHealth: number | null;
+}
+
+export interface RunRef {
+  acelo_run_id: string;
+  platform_run_id: string | null;
+  status: string;
+  completed_at: string | null;
 }
 
 export interface OverviewData {
@@ -52,6 +60,27 @@ export interface OverviewData {
   priorityOpportunities: Opportunity[];
   /** false when no completed run has produced results; drives the empty state. */
   hasData: boolean;
+  /** CLUSTER: current state per cluster, reporting only (no approvals). */
+  cluster?: {
+    clustersAnalyzed: number;
+    risky: number;
+    moderatelyOptimized: number;
+    optimized: number;
+    potentialSavings: number | null;
+    monthlyCost: number | null;
+    latestRun: RunRef | null;
+  } | null;
+  /** QUERY: approval items (one per query_id) + the latest query run's detection counts. */
+  query?: {
+    unhealthyQueries: number | null;
+    optimizationOpportunities: number | null;
+    approvalItems: number;
+    byStatus: Record<string, number>;
+    potentialSavings: number | null;
+    latestRun: RunRef | null;
+  } | null;
+  /** EXECUTION METRICS: every run counts (append-only history). */
+  executions?: { total: number; succeeded: number; failed: number; cancelled: number; active: number } | null;
 }
 
 export type AgentRoute = "Query Agent" | "Cluster Agent" | "Storage Agent" | "All Capabilities";

@@ -12,6 +12,17 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// This suite covers the legacy multi-platform experience (Fabric, the platform
+// switcher, multiple environments). Databricks-only is the default for the MVP,
+// so the legacy experience is selected explicitly here.
+vi.mock("../services/experience", async () => {
+  const actual = await vi.importActual<typeof import("../services/experience")>(
+    "../services/experience"
+  );
+  return { ...actual, isDatabricksOnly: () => false };
+});
+
+
 const ACCOUNT = {
   homeAccountId: "h",
   environment: "login.microsoftonline.com",
@@ -256,26 +267,27 @@ beforeEach(() => {
 });
 
 describe("Microsoft Fabric selection", () => {
-  it("is selected and stays selected (re-clicking does not wipe state)", async () => {
+  it("states the platform being configured instead of asking for it again", async () => {
     backend.env = { ...BASE_ENV, status: "connected", workspace_name: "acelo demo", last_verified_at: "x" };
-    const user = userEvent.setup();
     renderSettings();
 
-    const fabric = await screen.findByRole("button", { name: "Microsoft Fabric" });
-    expect(fabric).toHaveAttribute("aria-pressed", "true");
-    await screen.findByText(/^Connected$/);
+    // The connection already decided the platform, so the page reports it
+    // rather than offering the three selectable cards it used to.
+    const configuring = await screen.findByText("Configuring");
+    expect(configuring.parentElement).toHaveTextContent("Microsoft Fabric");
+    expect(screen.queryByRole("button", { name: "File Analysis" })).not.toBeInTheDocument();
 
-    await user.click(fabric);
-    expect(fabric).toHaveAttribute("aria-pressed", "true");
-    // The loaded connection must survive the click.
-    expect(screen.getByText(/^Connected$/)).toBeInTheDocument();
+    await screen.findByText(/^Connected$/);
     expect(screen.getByRole("button", { name: /^discover environment$/i })).toBeEnabled();
   });
 
-  it("the file card points to the AI Agent instead of a stale 'not available' message", async () => {
+  it("offers File Analysis through the Add connection flow", async () => {
     const user = userEvent.setup();
     renderSettings();
-    await user.click(await screen.findByRole("button", { name: "File Analysis" }));
+
+    await user.click(await screen.findByRole("button", { name: /add connection/i }));
+    await user.click(await screen.findByRole("button", { name: /File Analysis/ }));
+
     expect(screen.queryByText(/not available yet/i)).not.toBeInTheDocument();
     expect(screen.getByText(/no setup needed for file analysis/i)).toBeInTheDocument();
   });

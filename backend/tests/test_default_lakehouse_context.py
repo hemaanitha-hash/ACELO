@@ -159,10 +159,20 @@ def env(db_session, customer):
 
 
 def _configure(db_session, connection, **values):
-    metadata = json.loads(connection.auth_metadata)
-    metadata.update(values)
-    connection.auth_metadata = json.dumps(metadata)
-    db_session.commit()
+    """Settings go where the product stores them: the Environment Resource Registry.
+    `cluster_lakehouse_id=...` style names map to the cluster row's `lakehouse_id`."""
+    from models import Environment
+    from services import resource_registry
+
+    environment = db_session.query(Environment).filter(Environment.connection_id == connection.id).one()
+    by_domain: dict[str, dict] = {}
+    for name, value in values.items():
+        domain, _, key = name.partition("_")
+        if domain not in resource_registry.DOMAINS:
+            domain, key = "cluster", name  # unprefixed names were Cluster-era settings
+        by_domain.setdefault(domain, {})[key] = value
+    for domain, changes in by_domain.items():
+        resource_registry.update(db_session, environment, domain, changes)
 
 
 def test_configured_lakehouse_is_bound_even_when_discovery_cannot_see_it(db_session, env):

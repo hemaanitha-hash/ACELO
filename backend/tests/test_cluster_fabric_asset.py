@@ -57,8 +57,12 @@ def test_clusterfabric_is_the_registered_cluster_asset():
 
 
 def test_there_is_exactly_one_cluster_notebook():
-    notebooks = sorted(p.name for p in (PACKAGE / "cluster").glob("*.ipynb"))
-    assert notebooks == ["Clusterfabric.ipynb"], f"expected one notebook, found {notebooks}"
+    """Exactly one cluster notebook is DEPLOYED. Other copies in the folder are the
+    product team's reference files and are never deployed."""
+    manifest = json.loads((PACKAGE / "manifest.json").read_text(encoding="utf-8"))
+    cluster = [a["source"] for a in manifest["assets"] if a["domain"] == "cluster"]
+    assert cluster == ["cluster/Clusterfabric.ipynb"], cluster
+    assert all("email" not in a["source"].lower() for a in manifest["assets"])
 
 
 def test_notebook_carries_no_execution_outputs(notebook):

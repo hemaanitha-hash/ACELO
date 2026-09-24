@@ -1,8 +1,15 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Menu, RefreshCw, Bell, Loader2 } from "lucide-react";
+import { useMsal } from "@azure/msal-react";
 import { useRunMonitor } from "./RunMonitor";
 import { RUN_STATE_LABELS, formatTime } from "../services/runsApi";
+import {
+  getActiveContext,
+  PLATFORM_LABELS,
+  subscribe,
+  type ActiveContext,
+} from "../services/platformContext";
 
 interface TopbarProps {
   pageName: string;
@@ -141,7 +148,28 @@ function NotificationBell() {
   );
 }
 
+/** Initials of the signed-in Microsoft account; nothing when signed out (never a placeholder user). */
+function useInitials(): string | null {
+  const { instance } = useMsal();
+  let name = "";
+  try {
+    const account = instance.getActiveAccount() ?? instance.getAllAccounts()[0];
+    name = account?.name || account?.username || "";
+  } catch {
+    return null; // MSAL not initialised (e.g. service-principal only)
+  }
+  const parts = name.replace(/@.*/, "").split(/[\s._-]+/).filter(Boolean);
+  if (!parts.length) return null;
+  return (parts[0][0] + (parts.length > 1 ? parts[parts.length - 1][0] : "")).toUpperCase();
+}
+
 export default function Topbar({ pageName, onMenuClick, onRefresh }: TopbarProps) {
+  // Re-render when the user switches platform so the breadcrumb follows.
+  const [context, setContext] = useState<ActiveContext>(getActiveContext());
+  useEffect(() => subscribe(setContext), []);
+  const platform = context.platform;
+
+  const initials = useInitials();
   return (
     <header className="flex h-16 items-center justify-between border-b border-panel-border bg-canvas/95 backdrop-blur px-4 sm:px-6">
       <div className="flex items-center gap-3 min-w-0">
@@ -152,9 +180,19 @@ export default function Topbar({ pageName, onMenuClick, onRefresh }: TopbarProps
         >
           <Menu size={18} />
         </button>
+        {/* ACELO / <active platform> / <page> — the breadcrumb states which
+            platform's data the page is showing. */}
         <p className="truncate text-sm text-ink-muted">
           <span className="text-ink-faint">ACELO</span>
           <span className="mx-1.5 text-ink-faint">/</span>
+          {platform && (
+            <>
+              <span data-testid="breadcrumb-platform" className="text-ink-faint">
+                {PLATFORM_LABELS[platform]}
+              </span>
+              <span className="mx-1.5 text-ink-faint">/</span>
+            </>
+          )}
           <span className="font-medium text-ink">{pageName}</span>
         </p>
       </div>
@@ -168,9 +206,14 @@ export default function Topbar({ pageName, onMenuClick, onRefresh }: TopbarProps
           <RefreshCw size={16} />
         </button>
         <NotificationBell />
-        <span className="ml-2 flex h-8 w-8 items-center justify-center rounded-full bg-brand-500/15 border border-brand-500/25 text-xs font-semibold text-brand-300">
-          SN
-        </span>
+        {initials && (
+          <span
+            className="ml-2 flex h-8 w-8 items-center justify-center rounded-full bg-brand-500/15 border border-brand-500/25 text-xs font-semibold text-brand-300"
+            aria-label="Signed-in account"
+          >
+            {initials}
+          </span>
+        )}
       </div>
     </header>
   );

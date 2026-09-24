@@ -3,6 +3,8 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { AlertCircle, RefreshCw } from "lucide-react";
 import { useMsal } from "@azure/msal-react";
 import Layout from "../components/Layout";
+import PageHeader from "../components/PageHeader";
+import { StatePanel } from "../components/StateBlock";
 import { ApiError } from "../services/environmentApi";
 import { FabricAuthError, getFabricToken, getOneLakeToken } from "../services/fabricAuth";
 import {
@@ -35,6 +37,22 @@ const FILTERS: { status: ApprovalStatus; label: string }[] = [
   { status: "COMPLETED", label: "Completed" },
   { status: "FAILED", label: "Failed" },
 ];
+
+export function ValidationBadge({ status }: { status: string | null }) {
+  if (!status) return <span className="text-xs text-ink-muted">Not available</span>;
+  const verified = status === "verified";
+  return (
+    <span
+      className={`inline-flex rounded-sm border px-2 py-0.5 text-xs font-medium ${
+        verified
+          ? "border-signal-low/30 bg-signal-low/10 text-signal-low"
+          : "border-signal-medium/30 bg-signal-medium/10 text-signal-medium"
+      }`}
+    >
+      {verified ? "Verified" : "Review required"}
+    </span>
+  );
+}
 
 export default function Approvals() {
   const navigate = useNavigate();
@@ -111,13 +129,10 @@ export default function Approvals() {
   return (
     <Layout pageName="Approval Center" onRefresh={() => void load()}>
       <div className="flex flex-col gap-6">
-        <div>
-          <h1 className="text-display font-semibold text-ink">Approvals</h1>
-          <p className="mt-2 text-sm text-ink-muted">
-            Recommendations from real optimization runs. Nothing is applied without an approval
-            and an explicit execution.
-          </p>
-        </div>
+        <PageHeader
+          title="Approvals"
+          description="Recommendations from real optimization runs. Nothing is applied without an approval and an explicit execution."
+        />
 
         <div className="flex flex-wrap items-center gap-3">
           <button
@@ -126,13 +141,14 @@ export default function Approvals() {
             disabled={loading}
             className="inline-flex items-center gap-2 rounded-sm border border-brand-500 px-3 py-1.5 text-xs font-medium text-brand-500 hover:bg-brand-500/10 disabled:opacity-50"
           >
-            <RefreshCw size={14} /> Refresh from Fabric
+            <RefreshCw size={14} /> Refresh tracking
           </button>
           {sources
             .filter((src) => src.status === "ok")
             .map((src) => (
               <span key={src.environment_id} data-testid="tracking-ok" className="text-xs text-ink-muted">
-                Read {src.rows_read} rows from {src.table} · {src.created} new
+                Read {src.rows_read} rows from {src.table} · {src.unique_business_keys ?? src.candidates} clusters ·{" "}
+                {src.created ?? 0} new · {src.updated ?? 0} updated
               </span>
             ))}
         </div>
@@ -197,35 +213,29 @@ export default function Approvals() {
         </div>
 
         {loading && (
-          <div className="surface py-16 text-center text-sm text-ink-muted">Loading approvals...</div>
+          <StatePanel kind="loading" title="Loading approvals…" />
         )}
 
         {!loading && error && (
-          <div className="surface border-l-4 border-l-signal-high p-5">
-            <div className="flex items-start gap-3">
-              <AlertCircle size={18} className="mt-0.5 shrink-0 text-signal-high" />
-              <div>
-                <p className="text-sm font-medium text-ink">Unable to load optimization recommendations.</p>
-                <p className="mt-1 text-sm text-ink-muted">{error}</p>
-              </div>
-            </div>
-          </div>
+          <StatePanel
+            kind="error"
+            title="Unable to load optimization recommendations"
+            detail={error}
+          />
         )}
 
         {!loading && !error && approvals.length === 0 && (
-          <div className="surface py-16 text-center">
-            <p className="text-sm font-medium text-ink">
-              {cluster
+          <StatePanel
+            kind="empty"
+            title={
+              cluster
                 ? `No approval found for cluster ${cluster}.`
                 : status === "PENDING"
-                  ? "No pending approvals."
-                  : `No ${STATUS_TEXT[status].toLowerCase()} recommendations.`}
-            </p>
-            <p className="mt-1 text-sm text-ink-muted">
-              Clusters the optimizer flags as Risky or Moderately Optimized appear here after an
-              analysis completes.
-            </p>
-          </div>
+                  ? "No pending approvals"
+                  : `No ${STATUS_TEXT[status].toLowerCase()} recommendations`
+            }
+            detail="Query optimizations appear here after a Query Optimization run validates them. Cluster recommendations are reporting only and never need approval."
+          />
         )}
 
         {!loading && !error && approvals.length > 0 && (
@@ -234,33 +244,35 @@ export default function Approvals() {
               <table className="w-full text-left text-sm">
                 <thead>
                   <tr className="border-b border-panel-border text-xs uppercase text-ink-muted">
-                    <th className="py-2 pr-4 font-medium">Cluster</th>
-                    <th className="py-2 pr-4 font-medium">Risk</th>
-                    <th className="py-2 pr-4 font-medium">Current</th>
-                    <th className="py-2 pr-4 font-medium">Recommended</th>
+                    <th className="py-2 pr-4 font-medium">Query ID</th>
+                    <th className="py-2 pr-4 font-medium">Root cause</th>
+                    <th className="py-2 pr-4 font-medium">Validation</th>
                     <th className="py-2 pr-4 font-medium">Cost</th>
                     <th className="py-2 pr-4 font-medium">Savings</th>
                     <th className="py-2 pr-4 font-medium">Status</th>
+                    <th className="py-2 pr-4 font-medium">Created</th>
                     <th className="py-2 pr-4 font-medium">Action</th>
                   </tr>
                 </thead>
                 <tbody>
                   {approvals.map((a) => (
                     <tr key={a.approval_id} className="border-b border-panel-border/60">
-                      <td className="py-2 pr-4 text-ink">
+                      <td className="py-2 pr-4 font-mono text-xs text-ink">
                         {a.resource_name}
-                        <span className="block text-[11px] text-ink-faint">{a.platform}</span>
+                        {a.requires_new_approval && (
+                          <span className="ml-2 font-sans text-[11px] text-[#D71920]">new recommendation</span>
+                        )}
                       </td>
+                      <td className="py-2 pr-4 text-ink-muted">{a.optimization_label ?? "Not available"}</td>
                       <td className="py-2 pr-4">
-                        <span className={a.optimization_label === "Risky" ? "text-signal-high" : "text-signal-medium"}>
-                          {a.optimization_label ?? "Not available"}
-                        </span>
+                        <ValidationBadge status={a.platform_validation_status ?? null} />
                       </td>
-                      <td className="tabular py-2 pr-4 text-ink-muted">{display(a.current_workers)}</td>
-                      <td className="tabular py-2 pr-4 text-ink">{display(a.recommended_max_workers)}</td>
                       <td className="tabular py-2 pr-4 text-ink-muted">{display(a.total_dbus_cost_usd, usd)}</td>
                       <td className="tabular py-2 pr-4 text-ink">{display(a.potential_monthly_savings, usd)}</td>
                       <td className="py-2 pr-4 text-xs font-medium text-ink">{a.status}</td>
+                      <td className="py-2 pr-4 text-xs text-ink-muted">
+                        {a.created_at ? new Date(a.created_at).toLocaleString() : "Not available"}
+                      </td>
                       <td className="py-2 pr-4">
                         <button
                           type="button"

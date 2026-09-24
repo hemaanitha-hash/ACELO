@@ -9,6 +9,7 @@ import App from "./App";
 import "./index.css";
 import { msalConfig } from "./authConfig";
 import { logAuthEnvironment, logRedirectCallback } from "./services/authDiagnostics";
+import { loadRuntime } from "./services/runtime";
 
 /**
  * ACELO application entry point.
@@ -45,6 +46,11 @@ function render() {
 
 async function bootstrap(): Promise<void> {
   logAuthEnvironment();
+
+  // How ACELO is deployed decides whether the user is ever asked for a
+  // workspace URL or token. Read before the first render so no credential
+  // form flashes on screen inside a Databricks App.
+  await loadRuntime();
 
   try {
     await msalInstance.initialize();

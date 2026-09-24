@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Layout from "../components/Layout";
+import PageHeader from "../components/PageHeader";
+import { StatePanel } from "../components/StateBlock";
 import { ApiError } from "../services/environmentApi";
 import {
   RUN_STATES,
@@ -35,13 +37,6 @@ const OPTIMIZATIONS = [
   { value: "query", label: "Query Optimization" },
   { value: "storage", label: "Storage Optimization" },
 ];
-const PLATFORMS = [
-  { value: "", label: "All platforms" },
-  { value: "fabric", label: "Microsoft Fabric" },
-  { value: "databricks", label: "Databricks" },
-  { value: "file", label: "Uploaded file" },
-];
-
 const input =
   "rounded-sm border border-panel-border bg-white px-2.5 py-1.5 text-sm text-ink focus:border-[#D71920] focus:outline-none";
 
@@ -123,16 +118,6 @@ export default function History() {
             </select>
           </label>
           <label className="flex flex-col gap-1 text-xs text-ink-muted">
-            Platform
-            <select className={input} value={filters.platform ?? ""} onChange={set("platform")} aria-label="Platform">
-              {PLATFORMS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex flex-col gap-1 text-xs text-ink-muted">
             From
             <input type="date" className={input} value={filters.since ?? ""} onChange={set("since")} aria-label="From date" />
           </label>
@@ -145,22 +130,29 @@ export default function History() {
         {error ? (
           <div className="surface border-[#D71920]/30 px-4 py-6 text-sm text-[#D71920]">{error}</div>
         ) : loading && runs.length === 0 ? (
-          <div className="surface py-16 text-center text-sm text-ink-muted">Loading run history...</div>
+          <StatePanel kind="loading" title="Loading run history…" />
         ) : runs.length === 0 ? (
-          <div className="surface py-16 text-center text-sm text-ink-muted">No runs match these filters.</div>
+          <StatePanel
+            kind="empty"
+            title="No runs match these filters"
+            detail="Clear or widen the filters above to see more runs."
+          />
         ) : (
           <div className="surface overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-panel-border text-xs uppercase tracking-wide text-ink-faint">
                 <tr>
-                  <th className="px-4 py-3">Optimization</th>
-                  <th className="px-4 py-3">Status</th>
-                  <th className="px-4 py-3">Platform</th>
-                  <th className="px-4 py-3">Environment</th>
-                  <th className="px-4 py-3">Started</th>
-                  <th className="px-4 py-3">Duration</th>
                   <th className="px-4 py-3">ACELO Run ID</th>
-                  <th className="px-4 py-3">Platform Run ID</th>
+                  <th className="px-4 py-3">Optimization</th>
+                  <th className="px-4 py-3">Platform</th>
+                  <th className="px-4 py-3">Status</th>
+                  {/* Run History lists runs from whichever platform is active. */}
+                  <th className="px-4 py-3">Platform run ID</th>
+                  <th className="px-4 py-3">Started</th>
+                  <th className="px-4 py-3">Completed</th>
+                  <th className="px-4 py-3">Duration</th>
+                  <th className="px-4 py-3">Trigger</th>
+                  <th className="px-4 py-3">User</th>
                 </tr>
               </thead>
               <tbody>
@@ -170,19 +162,18 @@ export default function History() {
                     onClick={() => navigate(`/runs/${run.acelo_run_id}`)}
                     className="cursor-pointer border-b border-panel-border last:border-0 hover:bg-panel-hover"
                   >
-                    <td className="px-4 py-3 font-medium text-ink">
-                      {run.optimization}
-                      {run.retry_of_run_id && <span className="ml-2 text-xs text-ink-faint">re-run</span>}
-                    </td>
+                    <td className="px-4 py-3 font-mono text-xs text-ink-muted">{run.acelo_run_id}</td>
+                    <td className="px-4 py-3 font-medium text-ink">{run.optimization}</td>
+                    <td className="px-4 py-3 capitalize text-ink-muted">{run.platform}</td>
                     <td className="px-4 py-3">
                       <RunStateBadge state={run.status} />
                     </td>
-                    <td className="px-4 py-3 capitalize text-ink-muted">{run.platform}</td>
-                    <td className="px-4 py-3 text-ink-muted">{run.environment_name ?? "—"}</td>
-                    <td className="px-4 py-3 text-ink-muted">{formatTime(run.started_at ?? run.created_at)}</td>
-                    <td className="px-4 py-3 text-ink-muted">{formatDuration(run.duration_seconds)}</td>
-                    <td className="px-4 py-3 font-mono text-xs text-ink-muted">{run.acelo_run_id}</td>
                     <td className="px-4 py-3 font-mono text-xs text-ink-muted">{run.platform_run_id ?? "—"}</td>
+                    <td className="px-4 py-3 text-ink-muted">{formatTime(run.started_at ?? run.created_at)}</td>
+                    <td className="px-4 py-3 text-ink-muted">{formatTime(run.completed_at)}</td>
+                    <td className="px-4 py-3 text-ink-muted">{formatDuration(run.duration_seconds)}</td>
+                    <td className="px-4 py-3 text-ink-muted">{run.trigger ?? "—"}</td>
+                    <td className="px-4 py-3 text-ink-muted">{run.created_by ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>

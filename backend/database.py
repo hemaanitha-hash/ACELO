@@ -47,6 +47,15 @@ def ensure_columns() -> None:
             "platform_run_id": "VARCHAR",
             "metadata_json": "TEXT",
         },
+        "optimization_approvals": {
+            "last_seen_run_id": "VARCHAR",
+            "last_seen_at": "DATETIME",
+            "requires_new_approval": "BOOLEAN",
+            "latest_recommendation_json": "TEXT",
+            "original_sql": "TEXT",
+            "optimized_sql": "TEXT",
+            "platform_validation_status": "VARCHAR",
+        },
         "environments": {
             "auth_mode": "VARCHAR",
             "provisioning_status": "VARCHAR",

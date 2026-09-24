@@ -94,6 +94,11 @@ class DiscoveryOut(BaseModel):
     workspace: dict[str, Any] | None = None
     items: list[DiscoveredItemOut] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
+    # One entry per resource type the platform was asked about, carrying the
+    # state (SUCCESS_WITH_RESOURCES / SUCCESS_EMPTY / AUTHORIZATION_FAILED /
+    # NOT_SUPPORTED / API_ERROR / AUTHENTICATION_FAILED), the call that produced
+    # it and its resource count. Never carries a credential.
+    resource_states: list[dict[str, Any]] = Field(default_factory=list)
     discovered_at: str | None = None
     error_code: str | None = None
     message: str | None = None

@@ -9,8 +9,7 @@ import type {
   AuditEntry,
   Domain,
 } from "../types";
-
-const API_BASE = "http://localhost:8000/api";
+import { API_BASE } from "./apiBase";
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T | null> {
   try {
@@ -38,7 +37,7 @@ export async function getOverview(): Promise<OverviewData> {
   if (!data) {
     return {
       userName: "",
-      kpis: { monthlyCost: 0, potentialSavings: 0, openOpportunities: 0, optimizationHealth: null },
+      kpis: { monthlyCost: null, potentialSavings: null, openOpportunities: null, optimizationHealth: null },
       health: [],
       lastAnalysisMinutesAgo: null,
       platformConnected: null,
@@ -53,9 +52,9 @@ export async function getOverview(): Promise<OverviewData> {
   return {
     userName: data.userName ?? "",
     kpis: {
-      monthlyCost: data.kpis?.monthlyCost ?? 0,
-      potentialSavings: data.kpis?.potentialSavings ?? 0,
-      openOpportunities: data.kpis?.openOpportunities ?? 0,
+      monthlyCost: data.kpis?.monthlyCost ?? null,
+      potentialSavings: data.kpis?.potentialSavings ?? null,
+      openOpportunities: data.kpis?.openOpportunities ?? null,
       optimizationHealth: data.kpis?.optimizationHealth ?? null,
     },
     health: (data.health ?? []).map((h: any) => ({
@@ -75,9 +74,11 @@ export async function getOverview(): Promise<OverviewData> {
     // Only real recommendations; no demo rows injected.
     priorityOpportunities: await getOptimizations(),
     hasData: Boolean(data.hasData),
+    cluster: data.cluster ?? null,
+    query: data.query ?? null,
+    executions: data.executions ?? null,
   };
 }
-
 
 export async function getOptimizations(): Promise<Opportunity[]> {
   const data = await fetchJson<any[]>(`${API_BASE}/optimizations`);

@@ -8,9 +8,8 @@
 // ============================================================================
 
 import { ApiError, fabricTokenHeader } from "./environmentApi";
-
-const API_BASE =
-  (import.meta.env?.VITE_API_BASE as string | undefined) ?? "http://localhost:8000/api";
+import { platformHeaders } from "./platformContext";
+import { API_BASE } from "./apiBase";
 
 export const RUN_STATES = [
   "QUEUED",
@@ -58,6 +57,10 @@ export interface RunSummary {
   resource_id: string | null;
   created_by: string | null;
   retry_of_run_id: string | null;
+  /** The original run this re-run was started from (never overwritten). */
+  parent_run_id?: string | null;
+  /** "AI Agent" | "Re-run" | "File upload". */
+  trigger?: string | null;
   error_code: string | null;
   error_message: string | null;
   request: string | null;
@@ -116,7 +119,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   try {
     res = await fetch(`${API_BASE}${path}`, {
       ...options,
-      headers: { "Content-Type": "application/json", ...options?.headers },
+      headers: { "Content-Type": "application/json", ...platformHeaders(), ...options?.headers },
     });
   } catch {
     throw new ApiError("Could not reach the ACELO backend. Check that the API is running.", 0);

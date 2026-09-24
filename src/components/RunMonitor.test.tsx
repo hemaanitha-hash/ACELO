@@ -206,11 +206,10 @@ describe("run history", () => {
     expect(screen.getByText("2m 5s")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Status"), { target: { value: "FAILED" } });
     fireEvent.change(screen.getByLabelText("Optimization"), { target: { value: "cluster" } });
-    fireEvent.change(screen.getByLabelText("Platform"), { target: { value: "fabric" } });
     fireEvent.change(screen.getByLabelText("Search runs"), { target: { value: FABRIC_RUN_ID } });
     await waitFor(() =>
       expect(api.listRuns).toHaveBeenLastCalledWith(
-        expect.objectContaining({ status: "FAILED", domain: "cluster", platform: "fabric", search: FABRIC_RUN_ID })
+        expect.objectContaining({ status: "FAILED", domain: "cluster", search: FABRIC_RUN_ID })
       )
     );
   });

@@ -304,6 +304,8 @@ export default function RunDetails() {
           <h2 className="mb-3 text-sm font-semibold text-ink">Results</h2>
           {run.status !== "SUCCEEDED" ? (
             <p className="text-sm text-ink-muted">Results are available once the run succeeds.</p>
+          ) : run.domain === "query" && run.result ? (
+            <QueryRunResult result={run.result} />
           ) : !run.result ? (
             <p className="text-sm text-ink-muted">
               The run succeeded but its results have not been retrieved yet. They are read from OneLake when you are
@@ -349,5 +351,35 @@ export default function RunDetails() {
         </section>
       </div>
     </Layout>
+  );
+}
+
+/** A query run: detection counts + where its optimizations go (the Approval Center). */
+function QueryRunResult({ result }: { result: NonNullable<Details["result"]> }) {
+  const source = (result.source_payload ?? {}) as Record<string, unknown>;
+  const rows = Array.isArray(source.rows) ? (source.rows as Record<string, unknown>[]) : [];
+  const states = rows.reduce<Record<string, number>>((acc, r) => {
+    const s = String(r.workflow_status ?? "unknown").toLowerCase();
+    acc[s] = (acc[s] ?? 0) + 1;
+    return acc;
+  }, {});
+  const known = (v: unknown) => (typeof v === "number" ? String(v) : "Not available");
+  return (
+    <div data-testid="query-run-result">
+      <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        <Field label="Unhealthy queries" value={known(source.unhealthy_queries)} />
+        <Field label="Optimization opportunities" value={known(source.optimization_opportunities)} />
+        <Field label="Verified" value={String(states.verified ?? 0)} />
+        <Field label="Review required" value={String(states.review_required ?? 0)} />
+      </dl>
+      <p className="mt-3 text-xs text-ink-muted">
+        {typeof source.table === "string" ? `Read from ${source.table}. ` : ""}
+        Validated optimizations are reviewed in the{" "}
+        <Link to="/approvals" className="text-[#D71920] hover:underline">
+          Approval Center
+        </Link>
+        .
+      </p>
+    </div>
   );
 }

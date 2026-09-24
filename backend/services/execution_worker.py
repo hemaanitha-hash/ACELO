@@ -217,40 +217,11 @@ async def _finalize(db, job_run: JobRun) -> None:
             return
         token = None if connection.secret_encrypted else token_vault.fabric_token(job_run.id)
         onelake = token_vault.onelake_token(job_run.id)
-        # Results from OneLake (no SQL endpoint), then the pipeline's approval
-        # tracking table — both through the same adapter, both best effort.
+        # Results from OneLake (no SQL endpoint). fetch_and_store_result routes
+        # them: cluster -> current cluster state, query -> approval items.
         await job_service.fetch_and_store_result(db, connection, job_run, token, onelake_token=onelake)
-        await _import_tracking(db, connection, job_run, token, onelake)
     finally:
         token_vault.discard(job_run.id)
-
-
-async def _import_tracking(db, connection, job_run: JobRun, token, onelake) -> None:
-    from agent.router import build_adapter
-    from services import approval_service
-
-    if job_run.execution_type != "pipeline":
-        return
-    environment = db.query(Environment).filter(Environment.connection_id == connection.id).first()
-    if environment is None or approval_service.tracking_config(db, environment) is None:
-        return
-    adapter = build_adapter(connection, db, token)
-    adapter.onelake_token = onelake
-    outcome = await approval_service.import_tracking(db, environment, adapter)
-    if outcome["status"] == "ok":
-        run_events.emit(
-            db, job_run, "APPROVALS_IMPORTED",
-            f"Approval tracking read from OneLake: {outcome.get('created', 0)} new approval(s).",
-            level=run_events.SUCCESS, stage="approval_tracking",
-            metadata={k: outcome.get(k) for k in ("table", "rows_read", "candidates", "created")},
-        )
-    else:
-        run_events.emit(
-            db, job_run, "APPROVALS_IMPORT_FAILED",
-            f"Approval tracking could not be read: {outcome.get('message')}",
-            level=run_events.WARNING, stage="approval_tracking",
-            metadata={"error_code": outcome.get("error_code"), "table": outcome.get("table")},
-        )
 
 
 def _connection_for(db, job_run: JobRun) -> Connection | None:

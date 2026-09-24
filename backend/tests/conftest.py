@@ -11,6 +11,12 @@ import tempfile
 _tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 
 os.environ["APP_ENV"] = "development"
+os.environ["ACELO_SKIP_DOTENV"] = "1"
+# Runtime configuration never leaks from the developer's shell into tests.
+for _name in list(os.environ):
+    if _name in ("LAKEHOUSE", "LAKEHOUSE_ID", "LAKEHOUSE_WORKSPACE_ID", "TABLE_SCHEMA", "SOURCE_TABLE",
+                 "RESULT_TABLE", "ACELO_ADMIN_USERS", "ACELO_QUERY_LLM_API_KEY", "GROQ_API_KEY")             or (_name.startswith("ACELO_") and _name.split("_")[1] in ("CLUSTER", "QUERY", "STORAGE")):
+        del os.environ[_name]
 # Unit tests drive polling explicitly; real background pollers would sleep on
 # timers and make the suite slow and non-deterministic.
 os.environ["ACELO_BACKGROUND_POLLING"] = "0"

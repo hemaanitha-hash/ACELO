@@ -3,6 +3,8 @@ from .tables import (
     AnalysisJob,
     ApprovalRequest,
     ApprovalAudit,
+    ClusterRecommendation,
+    DomainResource,
     AuditHistory,
     Connection,
     Customer,
@@ -18,6 +20,8 @@ from .tables import (
 
 __all__ = [
     "Customer",
+    "ClusterRecommendation",
+    "DomainResource",
     "Connection",
     "Environment",
     "Resource",

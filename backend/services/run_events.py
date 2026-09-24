@@ -119,7 +119,10 @@ def notify_terminal(db: Session, run: JobRun) -> None:
         return
     title = DOMAIN_TITLES.get(run.domain, f"{run.domain.title()} Optimization")
     body = {
-        SUCCEEDED: f"Your {title.lower()} run has completed.",
+        SUCCEEDED: (
+            "Query optimization completed and is ready for review."
+            if run.domain == "query" else f"{title} completed."
+        ),
         FAILED: "Open execution details to view the error.",
         CANCELLED: "The run was cancelled.",
     }[state]
@@ -192,6 +195,9 @@ def run_summary(db: Session, run: JobRun) -> dict[str, Any]:
         "resource_id": run.platform_resource_id,
         "created_by": run.created_by,
         "retry_of_run_id": run.retry_of_run_id,
+        # Re-runs point at their original run; the original is never overwritten.
+        "parent_run_id": run.retry_of_run_id,
+        "trigger": "Re-run" if run.retry_of_run_id else ("File upload" if run.platform == "file" else "AI Agent"),
         "error_code": run.error_code,
         "error_message": run.error,
         "request": job.request if job else None,

@@ -11,6 +11,17 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// This suite covers the legacy multi-platform experience (Fabric, the platform
+// switcher, multiple environments). Databricks-only is the default for the MVP,
+// so the legacy experience is selected explicitly here.
+vi.mock("../services/experience", async () => {
+  const actual = await vi.importActual<typeof import("../services/experience")>(
+    "../services/experience"
+  );
+  return { ...actual, isDatabricksOnly: () => false };
+});
+
+
 const ACCOUNT = {
   homeAccountId: "h",
   environment: "login.microsoftonline.com",

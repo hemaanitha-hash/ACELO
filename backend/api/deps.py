@@ -39,3 +39,43 @@ def get_current_customer(
     db.commit()
     db.refresh(customer)
     return customer
+
+
+# --- administrator role for environment configuration ------------------------------
+
+def _admin_list() -> set[str]:
+    import os
+
+    return {v.strip().lower() for v in (os.getenv("ACELO_ADMIN_USERS") or "").split(",") if v.strip()}
+
+
+def resource_access(
+    x_acelo_user_id: str | None = Header(default=None),
+    x_acelo_user_email: str | None = Header(default=None),
+    x_acelo_user_name: str | None = Header(default=None),
+) -> dict:
+    """
+    Who may change environment resource configuration. Administrators are the
+    users listed in ACELO_ADMIN_USERS (emails or Entra object ids). Without that
+    list, editing is allowed only in APP_ENV=development (local setup); a
+    production deployment without it is read-only for everyone.
+    """
+    from config import get_settings
+
+    admins = _admin_list()
+    identities = {v.strip().lower() for v in (x_acelo_user_id, x_acelo_user_email) if v and v.strip()}
+    if admins:
+        allowed, basis = bool(identities & admins), "ACELO_ADMIN_USERS"
+    else:
+        allowed, basis = not get_settings().is_production, "development"
+    return {"can_configure_resources": allowed, "basis": basis,
+            "user": (x_acelo_user_name or x_acelo_user_email or "").strip() or None}
+
+
+def require_resource_admin(access: dict = Depends(resource_access)) -> dict:
+    if not access["can_configure_resources"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Resource mapping is administrator configuration. Ask your ACELO administrator to change it.",
+        )
+    return access

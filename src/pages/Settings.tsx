@@ -7,6 +7,7 @@ import {
   Loader2,
   LogIn,
   Package,
+  Plus,
   RefreshCw,
   ShieldCheck,
   Upload,
@@ -16,7 +17,19 @@ import { useMsal } from "@azure/msal-react";
 import { InteractionStatus } from "@azure/msal-browser";
 import type { AccountInfo } from "@azure/msal-browser";
 import Layout from "../components/Layout";
+import OptimizationResources from "../components/OptimizationResources";
+import Modal from "../components/Modal";
 import { isMsalConfigured, REDIRECT_URI_SETUP_HINT } from "../authConfig";
+import {
+  getActiveContext,
+  setActiveContext,
+  subscribe,
+  type ActivePlatformId,
+} from "../services/platformContext";
+import { listPlatformConnections } from "../services/platformConnections";
+import { explainState } from "../services/discoveryText";
+import { getRuntime } from "../services/runtime";
+import { isDatabricksOnly } from "../services/experience";
 import {
   describeAccount,
   FabricAuthError,
@@ -37,6 +50,7 @@ import {
   listEnvironments,
   provisionEnvironment,
   saveClusterSettings,
+  setRequestIdentity,
   testEnvironment,
   updateEnvironment,
   type ClusterExecution,
@@ -125,6 +139,20 @@ const COUNT_ORDER = [
   "Job",
 ];
 
+/** Labels for the normalised resource types used by per-type discovery states. */
+const RESOURCE_TYPE_LABELS: Record<string, string> = {
+  CLASSIC_CLUSTER: "Classic clusters",
+  SERVERLESS_COMPUTE: "Serverless compute",
+  SQL_WAREHOUSE: "SQL warehouses",
+};
+
+/** Short platform names, for inline sentences where the full label reads oddly. */
+const SHORT_PLATFORM_LABELS: Record<EnvironmentPlatform, string> = {
+  fabric: "Fabric",
+  databricks: "Databricks",
+  file: "File analysis",
+};
+
 const COUNT_LABELS: Record<string, string> = {
   Folder: "Folders",
   Notebook: "Notebooks",
@@ -134,6 +162,8 @@ const COUNT_LABELS: Record<string, string> = {
   Experiment: "Experiments",
   Cluster: "Clusters",
   Job: "Jobs",
+  SQLWarehouse: "SQL Warehouses",
+  ServerlessCompute: "Serverless Compute",
 };
 
 export default function Settings() {
@@ -142,9 +172,56 @@ export default function Settings() {
   // previous version seeded a useState initializer once at mount, so an account
   // that arrived afterwards was never picked up and the UI stayed signed-out.
   const { instance, accounts, inProgress } = useMsal();
+  // Identity (not a token) so the backend can tell administrators from users.
+  useEffect(() => {
+    setRequestIdentity((instance.getActiveAccount?.() ?? accounts[0]) || null);
+  }, [instance, accounts]);
   const navigate = useNavigate();
-  const [platform, setPlatform] = useState<EnvironmentPlatform>("fabric");
+  /**
+   * Which platform this page configures.
+   *
+   * Seeded from the GLOBAL active platform context — the same one the Sidebar,
+   * breadcrumb and every API call use. It was previously `useState("fabric")`,
+   * a second source of truth that ignored the connected platform entirely: with
+   * Databricks active the page still selected Microsoft Fabric, then loaded the
+   * Fabric environment and its Microsoft Account auth mode, rendering Fabric
+   * fields over a Databricks connection.
+   *
+   * Local state remains because "file" is a setup view rather than a platform
+   * anyone is "in", and because a platform can be configured here before any
+   * connection for it exists. For databricks/fabric the context is authoritative
+   * and is kept in step in both directions.
+   */
+  const [platform, setPlatform] = useState<EnvironmentPlatform>(
+    // Databricks-only is the MVP, so it is also the fallback when no context
+    // has resolved yet. Falling back to Fabric here rendered the Fabric
+    // authentication block for a moment in a Databricks-only build.
+    () => getActiveContext().platform ?? (isDatabricksOnly() ? "databricks" : "fabric")
+  );
   const [authMode, setAuthMode] = useState<AuthMode>("service_principal");
+  /**
+   * "Add connection" mode. While true the page configures a NEW platform the
+   * user explicitly chose, rather than the one they are connected to — which is
+   * why the platform choice lives in that flow and nowhere else.
+   */
+  const [addOpen, setAddOpen] = useState(false);
+  const [addingConnection, setAddingConnection] = useState(false);
+  /** The connection the user is working in, for the "Configuring" heading. */
+  const activeConnectionName = getActiveContext().connection?.name ?? null;
+  /**
+   * As a Databricks App the workspace and identity come from the runtime, so
+   * ACELO must not ask for a workspace URL, an access token, or a platform —
+   * there is nothing for the user to decide and nothing to store.
+   */
+  const runtime = getRuntime();
+  /**
+   * The Databricks-only MVP manages its own connection through the Databricks
+   * App runtime. Credential entry, the platform picker and Add connection are
+   * ABSENT from this experience — not merely disabled — because there is
+   * nothing for the user to decide.
+   */
+  const databricksOnly = isDatabricksOnly();
+  const appManaged = databricksOnly || (runtime.databricks_app && platform === "databricks");
   const [signedInAccount, setSignedInAccount] = useState<AccountInfo | null>(null);
   const [signingIn, setSigningIn] = useState(false);
 
@@ -180,6 +257,8 @@ export default function Settings() {
   // What the backend persisted on the last successful save — the confirmation
   // shows THIS, never the form's local values.
   const [savedState, setSavedState] = useState<ClusterSettingsState | null>(null);
+  // Resource mapping is administrator configuration; read-only for everyone else.
+  const [canConfigure, setCanConfigure] = useState(true);
   const [saveError, setSaveError] = useState<string | null>(null);
   // Backend-resolved execution path and the workspace's pipelines.
   const [clusterExecution, setClusterExecution] = useState<ClusterExecution | null>(null);
@@ -216,6 +295,73 @@ export default function Settings() {
     setClusterExecution(state.execution ?? null);
     setPipelines(state.pipelines ?? []);
   }
+
+  /**
+   * Clears everything belonging to the platform being left.
+   *
+   * Without this the previous platform's form values and auth mode survived a
+   * switch, so a Fabric tenant/workspace could sit in a Databricks form — the
+   * two platforms' configuration must never mix.
+   */
+  /**
+   * Points the global context at the chosen platform's connection. If none
+   * exists yet (first-time setup) the page still switches locally so it can be
+   * configured — a connection is never invented to satisfy the switch.
+   */
+  async function switchActivePlatform(next: ActivePlatformId) {
+    try {
+      const connections = await listPlatformConnections();
+      const match = connections.find((c) => c.platform === next);
+      if (match) setActiveContext(match);
+    } catch {
+      /* the local view still switched; pages surface their own errors */
+    }
+  }
+
+  /** Starts configuring a platform the user picked from the Add flow. */
+  function beginAddConnection(next: EnvironmentPlatform) {
+    setAddOpen(false);
+    clearPlatformState();
+    setAddingConnection(true);
+    setPlatform(next);
+  }
+
+  /** Abandons the new connection and returns to the one in use. */
+  function cancelAddConnection() {
+    setAddingConnection(false);
+    clearPlatformState();
+    setPlatform(getActiveContext().platform ?? (isDatabricksOnly() ? "databricks" : "fabric"));
+  }
+
+  function clearPlatformState() {
+    setForm({ name: "", tenantId: "", workspaceId: "", clientId: "", clientSecret: "", endpoint: "" });
+    setAuthMode("service_principal");
+    setReadiness(null);
+    setClusterSettings(EMPTY_CLUSTER_SETTINGS);
+    setClusterMissing([]);
+    setEnvironment(null);
+    setTestResult(null);
+    setDiscovery(null);
+    setProvisioning(null);
+    setSavedState(null);
+    setError(null);
+  }
+
+  // The global context is authoritative: switching platform anywhere in the
+  // app (the Sidebar switcher included) re-points this page too.
+  useEffect(
+    () =>
+      subscribe((ctx) => {
+        // While adding a connection the user is deliberately configuring a
+        // different platform; a context update must not yank them back.
+        if (addingConnection) return;
+        if (ctx.platform && ctx.platform !== platform) {
+          clearPlatformState();
+          setPlatform(ctx.platform);
+        }
+      }),
+    [platform, addingConnection]
+  );
 
   // Restore the persisted environment so a page refresh keeps safe state.
   // Only non-secret fields come back from the API.
@@ -440,15 +586,19 @@ export default function Settings() {
     connected && discovered && installed && Boolean(provisioning?.domains?.cluster?.ready);
 
   // The actual reason each later step is unavailable — never a dead button.
-  const discoverBlockedReason = !environment || !connected ? "Fabric connection required." : null;
+  // Named for the ACTIVE platform: this string was hardcoded to Fabric and
+  // appeared even while configuring Databricks. The short name is used so the
+  // Fabric wording is unchanged ("Fabric connection required.").
+  const connectionRequired = `${SHORT_PLATFORM_LABELS[platform]} connection required.`;
+  const discoverBlockedReason = !environment || !connected ? connectionRequired : null;
   const provisionBlockedReason = !connected
-    ? "Fabric connection required."
+    ? connectionRequired
     : !discovered
       ? "Environment discovery required."
       : provisioning?.deployable === false
         ? "This ACELO build has no optimization notebooks bundled, so there is nothing to deploy."
         : null;
-  const settingsBlockedReason = !environment || !connected ? "Fabric connection required." : null;
+  const settingsBlockedReason = !environment || !connected ? connectionRequired : null;
 
   // Cluster is independent of Query and Storage. The backend is the authority
   // on this; the local expression is only a fallback before readiness loads.
@@ -469,44 +619,52 @@ export default function Settings() {
 
         {/* ---------------- Configuration ---------------- */}
         <section className="surface p-6">
-          <h2 className="text-lg font-semibold text-ink">Platform</h2>
-
-          <div className="mt-4 grid gap-4 md:grid-cols-3">
-            {(Object.keys(PLATFORM_LABELS) as EnvironmentPlatform[]).map((p) => {
-              const Icon = p === "fabric" ? Cloud : p === "databricks" ? Database : Upload;
-              const active = platform === p;
-              return (
-                <button
-                  key={p}
-                  type="button"
-                  aria-pressed={active}
-                  onClick={() => {
-                    // Re-clicking the selected card used to wipe the loaded
-                    // environment without reloading it (the restore effect only
-                    // re-runs when the platform changes), disabling every step.
-                    if (p === platform) return;
-                    setPlatform(p);
-                    setReadiness(null);
-                    setClusterSettings(EMPTY_CLUSTER_SETTINGS);
-                    setClusterMissing([]);
-                    setEnvironment(null);
-                    setTestResult(null);
-                    setDiscovery(null);
-                    setProvisioning(null);
-                    setError(null);
-                  }}
-                  className={`rounded-md border p-4 text-left transition ${
-                    active
-                      ? "border-brand-500 bg-brand-500/5 ring-1 ring-brand-500/30"
-                      : "border-panel-border bg-white hover:border-brand-500/50"
-                  }`}
-                >
-                  <Icon size={20} className="text-brand-500" />
-                  <p className="mt-3 text-sm font-semibold text-ink">{PLATFORM_LABELS[p]}</p>
+          {/* The active connection already decided the platform, so this page
+              no longer asks again. It states what is being configured and
+              offers a separate, explicit flow for adding a different platform —
+              "change what I am connected to" and "connect something new" are
+              different intents and were previously the same row of cards. */}
+          {addingConnection ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="label-eyebrow">New connection</p>
+                <h2 className="mt-1 text-lg font-semibold text-ink">
+                  {PLATFORM_LABELS[platform]}
+                </h2>
+                <p className="mt-1 text-sm text-ink-muted">
+                  Configure this platform, then test the connection to save it.
+                </p>
+              </div>
+              <button type="button" className="btn-secondary" onClick={cancelAddConnection}>
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="label-eyebrow">Configuring</p>
+                <h2 className="mt-1 flex flex-wrap items-center gap-2 text-lg font-semibold text-ink">
+                  {PLATFORM_LABELS[platform]}
+                  {activeConnectionName && (
+                    <span className="truncate text-sm font-normal text-ink-muted">
+                      · {activeConnectionName}
+                    </span>
+                  )}
+                </h2>
+                <p className="mt-1 text-sm text-ink-muted">
+                  {databricksOnly
+                    ? "ACELO runs inside this Databricks workspace and connects with the Databricks App identity."
+                    : "Settings for the connection you are currently working in. Switch platform from the selector in the sidebar."}
+                </p>
+              </div>
+              {!runtime.databricks_app && !databricksOnly && (
+                <button type="button" className="btn-secondary" onClick={() => setAddOpen(true)}>
+                  <Plus size={15} />
+                  Add connection
                 </button>
-              );
-            })}
-          </div>
+              )}
+            </div>
+          )}
 
           {platform === "file" ? (
             <div className="mt-6 rounded-md border border-panel-border bg-canvas-raised p-4">
@@ -611,7 +769,7 @@ export default function Settings() {
                         type="button"
                         onClick={() => void handleSignIn()}
                         disabled={signingIn || inProgress !== InteractionStatus.None}
-                        className="mt-3 inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-50"
+                        className="btn-primary mt-3 "
                       >
                         {signingIn ? <Loader2 size={16} className="animate-spin" /> : <LogIn size={16} />}
                         {signingIn || inProgress !== InteractionStatus.None
@@ -631,7 +789,19 @@ export default function Settings() {
                   placeholder={isFabric ? "Fabric Production" : "Databricks Production"}
                 />
 
-                {isFabric ? (
+                {appManaged ? (
+                  <div className="sm:col-span-2">
+                    <p className="text-sm font-medium text-ink">Workspace</p>
+                    <p className="mt-1 break-all font-mono text-xs text-ink-muted">
+                      {runtime.workspace_host}
+                    </p>
+                    <p className="mt-3 text-sm text-ink-muted">
+                      ACELO is running as a Databricks App and authenticates with the App's own
+                      identity in this workspace. There is no workspace URL or access token to
+                      enter, and no credential is stored.
+                    </p>
+                  </div>
+                ) : isFabric ? (
                   <>
                     {/* Tenant / Client / Secret are Service Principal only. */}
                     {!isUserMode && (
@@ -666,7 +836,7 @@ export default function Settings() {
                   />
                 )}
 
-                {!isUserMode && (
+                {!isUserMode && !appManaged && (
                   <Field
                     label={isFabric ? "Client Secret" : "Access Token"}
                     type="password"
@@ -688,7 +858,7 @@ export default function Settings() {
                   type="button"
                   onClick={handleTestConnection}
                   disabled={!canTest || stage !== "idle"}
-                  className="inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-brand-600 disabled:opacity-50"
+                  className="btn-primary"
                 >
                   {stage === "testing" && <Loader2 size={16} className="animate-spin" />}
                   {stage === "testing" ? "Testing connection..." : "Test Connection"}
@@ -806,7 +976,7 @@ export default function Settings() {
             type="button"
             onClick={handleDiscover}
             disabled={discoverBlockedReason !== null || stage !== "idle"}
-            className="mt-4 inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-brand-600 disabled:opacity-50"
+            className="btn-primary mt-4 "
           >
             {stage === "discovering" && <Loader2 size={16} className="animate-spin" />}
             {stage === "discovering" ? "Discovering environment..." : "Discover Environment"}
@@ -834,11 +1004,59 @@ export default function Settings() {
                     ))}
                   </div>
 
-                  {discovery.items.length === 0 && (
-                    <p className="mt-4 text-sm text-ink-muted">
-                      This workspace is empty — no items were returned by the platform.
-                    </p>
+                  {/* Per-resource-type outcome. A type that could not be read
+                      is reported as such — never folded into "empty". The
+                      wording comes from the shared explainer so this page and
+                      Compute discovery say the same thing about the same code,
+                      and neither prints a raw enum at the user. */}
+                  {(discovery.resource_states ?? []).some(
+                    (s) => s.state !== "SUCCESS_WITH_RESOURCES" && s.state !== "SUCCESS_EMPTY"
+                  ) && (
+                    <ul className="mt-4 space-y-2" data-testid="discovery-states">
+                      {(discovery.resource_states ?? [])
+                        .filter(
+                          (s) => s.state !== "SUCCESS_WITH_RESOURCES" && s.state !== "SUCCESS_EMPTY"
+                        )
+                        .map((s) => {
+                          const explanation = explainState(s.state);
+                          return (
+                            <li key={s.resource_type} className="flex flex-wrap gap-x-2 text-sm">
+                              <span className="font-medium text-ink">
+                                {RESOURCE_TYPE_LABELS[s.resource_type] ?? s.resource_type}
+                              </span>
+                              <span
+                                className={
+                                  explanation.kind === "error"
+                                    ? "text-signal-high"
+                                    : explanation.kind === "unavailable"
+                                      ? "text-signal-medium"
+                                      : "text-ink-muted"
+                                }
+                              >
+                                {explanation.title}
+                              </span>
+                              <span className="w-full text-xs text-ink-faint">
+                                {explanation.detail}
+                              </span>
+                            </li>
+                          );
+                        })}
+                    </ul>
                   )}
+
+                  {/* "Empty" is claimed ONLY when every supported call succeeded
+                      and returned zero. With no per-type states (other
+                      platforms), fall back to the item count as before. */}
+                  {discovery.items.length === 0 &&
+                    ((discovery.resource_states ?? []).length === 0
+                      ? true
+                      : (discovery.resource_states ?? []).every(
+                          (s) => s.state === "SUCCESS_EMPTY"
+                        )) && (
+                      <p className="mt-4 text-sm text-ink-muted">
+                        This workspace is empty — the platform reported no items.
+                      </p>
+                    )}
 
                   {discovery.items.length > 0 && (
                     <div className="mt-5 overflow-x-auto">
@@ -999,7 +1217,7 @@ export default function Settings() {
               type="button"
               onClick={() => void handleProvision()}
               disabled={provisionBlockedReason !== null || stage !== "idle"}
-              className="inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-brand-600 disabled:opacity-50"
+              className="btn-primary"
             >
               {stage === "provisioning" && <Loader2 size={16} className="animate-spin" />}
               {provisioning?.status === "UPDATE_AVAILABLE"
@@ -1112,19 +1330,24 @@ export default function Settings() {
           )}
         </section>
 
-        {/* ---------------- Cluster settings ---------------- */}
-        <section className="surface p-6">
-          <h2 className="flex items-center gap-2 text-lg font-semibold text-ink">
+        {/* ---------------- Optimization resources (per-domain registry) ----------------
+            Users never fill these in to run anything: the AI Agent picks the domain from the
+            request and the backend loads that domain's mapping. The Cluster form below is the
+            administrator's Cluster mapping, kept inside "Advanced". */}
+        <OptimizationResources environmentId={environment?.id ?? null} refreshKey={savedState}
+                               onAccess={setCanConfigure}>
+        <fieldset data-testid="cluster-mapping" disabled={!canConfigure} className="min-w-0">
+          <h3 className="flex items-center gap-2 text-base font-semibold text-ink">
             Cluster Settings
             {environment && clusterMissing.length === 0 && connected && (
               <span className="flex items-center gap-1 text-sm font-medium text-signal-low">
                 <CheckCircle2 size={16} /> Configured
               </span>
             )}
-          </h2>
+          </h3>
           <p className="mt-1 text-sm text-ink-muted">
-            What the Cluster notebook reads and writes in your workspace. These are passed to the
-            notebook as runtime parameters on every run. Names only — no credentials.
+            Cluster resource mapping: what the Cluster notebook reads and writes. Passed to the
+            Cluster notebook only, as runtime parameters. Names only — no credentials.
           </p>
 
           <div className="mt-5 grid gap-5 md:grid-cols-2">
@@ -1233,7 +1456,7 @@ export default function Settings() {
               type="button"
               onClick={() => void handleSaveClusterSettings()}
               disabled={settingsBlockedReason !== null || stage !== "idle"}
-              className="inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-brand-600 disabled:opacity-50"
+              className="btn-primary"
             >
               {stage === "saving" && <Loader2 size={16} className="animate-spin" />}
               Save Cluster Settings
@@ -1283,7 +1506,8 @@ export default function Settings() {
               </p>
             )
           )}
-        </section>
+        </fieldset>
+        </OptimizationResources>
 
         {/* ---------------- Readiness ---------------- */}
         <section className="surface p-6">
@@ -1336,7 +1560,7 @@ export default function Settings() {
               <button
                 type="button"
                 onClick={() => navigate("/agent")}
-                className="mt-4 inline-flex items-center gap-2 rounded-md bg-brand-500 px-5 py-2.5 text-sm font-medium text-white hover:bg-brand-600"
+                className="btn-primary mt-4 "
               >
                 Go to AI Agent
               </button>
@@ -1357,6 +1581,42 @@ export default function Settings() {
           </div>
         </div>
       </div>
+      {/* Choosing a platform happens HERE and only here — the deliberate act of
+          connecting something new, kept apart from the settings of the
+          connection already in use. */}
+      <Modal
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        title="Add connection"
+        subtitle="Choose the platform to connect. Your current connection is unaffected."
+      >
+        <ul className="space-y-2">
+          {(Object.keys(PLATFORM_LABELS) as EnvironmentPlatform[]).map((p) => {
+            const Icon = p === "fabric" ? Cloud : p === "databricks" ? Database : Upload;
+            return (
+              <li key={p}>
+                <button
+                  type="button"
+                  onClick={() => beginAddConnection(p)}
+                  className="flex w-full items-center gap-3 rounded-md border border-panel-border bg-white p-4 text-left transition hover:border-brand-500/50"
+                >
+                  <Icon size={18} className="shrink-0 text-brand-500" />
+                  <span>
+                    <span className="block text-sm font-semibold text-ink">
+                      {PLATFORM_LABELS[p]}
+                    </span>
+                    <span className="mt-0.5 block text-xs text-ink-muted">
+                      {p === "file"
+                        ? "Analyse an uploaded Cluster CSV — no connection needed."
+                        : `Connect a ${PLATFORM_LABELS[p]} workspace.`}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </Modal>
     </Layout>
   );
 }

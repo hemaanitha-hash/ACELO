@@ -30,7 +30,7 @@ from platforms.errors import ErrorCode, PlatformError, code_for_status
 trace_logger = logging.getLogger("acelo.fabric.trace")
 
 # Parameter names whose VALUES are never logged — they point at credentials.
-SENSITIVE_PARAMETERS = frozenset({"llm_key_vault_uri", "llm_secret_name"})
+SENSITIVE_PARAMETERS = frozenset({"llm_key_vault_uri", "llm_secret_name", "llm_api_key"})
 
 
 def redact_parameters(parameters: dict[str, Any] | None) -> dict[str, str]:
@@ -716,6 +716,31 @@ class FabricAdapter(PlatformAdapter):
     # What the tracking notebook needs, forwarded from the same pipeline parameters.
     TRACKING_PARAMETERS = ("acelo_run_id", "result_table", "result_schema", "approval_tracking_table")
 
+    QUERY_PIPELINE_ACTIVITY = "Run ACELO Query Notebook"
+    # What the query notebook receives. llm_api_key is a SecureString: masked in
+    # Fabric's run history and never echoed by the activity.
+    QUERY_PIPELINE_PARAMETERS = ("acelo_run_id", "environment_id", "validation_batch_size", "llm_api_key")
+    SECURE_PARAMETERS = frozenset({"llm_api_key"})
+
+    @classmethod
+    def query_pipeline_definition(cls, notebook_id: str, workspace_id: str) -> dict[str, Any]:
+        """pipeline-content.json for ACELO_Query_Optimization_Pipeline: one Notebook activity."""
+        activity = cls._notebook_activity(
+            cls.QUERY_PIPELINE_ACTIVITY, notebook_id, workspace_id, cls.QUERY_PIPELINE_PARAMETERS
+        )
+        activity["policy"]["secureInput"] = True  # the activity input carries the API key
+        content = {
+            "properties": {
+                "activities": [activity],
+                "parameters": {
+                    name: {"type": "securestring" if name in cls.SECURE_PARAMETERS else "string", "defaultValue": ""}
+                    for name in cls.QUERY_PIPELINE_PARAMETERS
+                },
+            }
+        }
+        payload = base64.b64encode(json.dumps(content).encode("utf-8")).decode()
+        return {"parts": [{"path": "pipeline-content.json", "payload": payload, "payloadType": "InlineBase64"}]}
+
     @classmethod
     def _notebook_activity(cls, name: str, notebook_id: str, workspace_id: str, parameters, depends_on=None):
         return {
@@ -1141,6 +1166,9 @@ class FabricAdapter(PlatformAdapter):
             )
 
         is_pipeline = execution_type == "pipeline"
+        if is_pipeline and domain == "query":
+            # The ACELO Query pipeline declares exactly these parameters.
+            parameters = {k: v for k, v in (parameters or {}).items() if k in self.QUERY_PIPELINE_PARAMETERS}
         body = (
             self._pipeline_execution_body(parameters) if is_pipeline else self._execution_body(parameters)
         )
@@ -1374,14 +1402,66 @@ class FabricAdapter(PlatformAdapter):
             },
         )
 
+    # Tables the query notebooks (UnhealtyQuery_detection + Validation) write.
+    QUERY_TRACKING_TABLE = "query_tracking_full_v1"
+    QUERY_UNHEALTHY_TABLE = "finops_unhealthy_queries"
+    QUERY_OPPORTUNITY_TABLE = "query_email_input"
+
+    async def _get_query_result_onelake(self, acelo_run_id: str | None) -> RunResult:
+        """
+        Query optimization results, read from OneLake Delta (no SQL endpoint).
+
+        The query notebooks overwrite their scoring tables per run and keep the
+        tracking table as current state, so this returns the state as of this
+        run's completion: the tracking rows (the approval candidates with their
+        validation verdicts) plus the unhealthy-query and opportunity counts.
+        """
+        lakehouse_id = self.auth_metadata.get("query_result_lakehouse_id")
+        if not lakehouse_id:
+            raise ResultConfigurationError(
+                ErrorCode.RESULT_RETRIEVAL_FAILED,
+                "The query run finished, but no Lakehouse is configured for Query optimization. "
+                "Set the Query Lakehouse in Environment Setup > Optimization Resources.",
+                log_detail="query result read without a lakehouse id",
+            )
+        schema = (self.auth_metadata.get("query_result_schema") or "").strip() or None
+        workspace = self.auth_metadata.get("query_result_lakehouse_workspace_id") or None
+        tracking_table = (self.auth_metadata.get("query_approval_tracking_table") or self.QUERY_TRACKING_TABLE).strip()
+        tracking = await self.read_delta_table(lakehouse_id, tracking_table, schema, workspace_id=workspace)
+
+        async def count(table: str) -> int | None:
+            try:
+                return len(await self.read_delta_table(lakehouse_id, table, schema, workspace_id=workspace))
+            except PlatformError:
+                return None  # unknown stays unknown, never 0
+
+        reference = f"OneLake {schema + '.' if schema else ''}{tracking_table}"
+        return RunResult(
+            result_reference=reference,
+            payload={
+                "table": reference,
+                "row_count": len(tracking),
+                "rows": tracking,
+                "acelo_run_id": acelo_run_id,
+                "unhealthy_queries": await count(self.QUERY_UNHEALTHY_TABLE),
+                "optimization_opportunities": await count(self.QUERY_OPPORTUNITY_TABLE),
+                "source": "onelake",
+            },
+        )
+
     def _result_table(self, domain: str = "cluster") -> str:
         """The table the existing optimization notebook writes to. Configurable
         per environment; falls back to the established default so existing
         deployments keep working. The notebook itself is NOT modified."""
-        return (
-            self.auth_metadata.get(f"{domain}_result_table")
-            or self.auth_metadata.get("cluster_result_table")
-            or self.CLUSTER_RESULT_TABLE
+        configured = self.auth_metadata.get(f"{domain}_result_table")
+        if configured:
+            return configured
+        if domain == "cluster":
+            return self.CLUSTER_RESULT_TABLE  # the Cluster notebook's established default
+        raise PlatformError(
+            ErrorCode.INVALID_CONFIGURATION,
+            f"No result table is configured for {domain} optimization in this environment.",
+            log_detail=f"{domain}_result_table not set",
         )
 
     async def get_run_result(
@@ -1396,6 +1476,8 @@ class FabricAdapter(PlatformAdapter):
         result table accumulates a row set per run, so an unscoped read would
         return rows from earlier runs — a stale result presented as this one's.
         """
+        if domain == "query":
+            return await self._get_query_result_onelake(acelo_run_id)
         lakehouse_id = self.auth_metadata.get(f"{domain}_result_lakehouse_id")
         if lakehouse_id:
             return await self._get_run_result_onelake(domain, lakehouse_id, acelo_run_id)
@@ -1559,14 +1641,26 @@ class FabricAdapter(PlatformAdapter):
     # --- execution of approved changes (Phase 7/8 - deliberately not built) ---
 
     async def start_execution(self, action: dict[str, Any]) -> StartAnalysisResult:
-        raise PlatformCapabilityNotImplemented(
-            self.platform_name, "start_execution", "Applying optimizations is Phase 7/8, not built yet."
-        )
+        """
+        Applies an APPROVED optimization. Only query optimizations are
+        executable: ACELO runs the "Apply Approved Query" notebook (the approved
+        branch of the retired email notebook - append to updated_query, mark the
+        tracking row APPLIED). Cluster recommendations are reporting only.
+        """
+        if action.get("type") != "query_apply":
+            raise PlatformCapabilityNotImplemented(
+                self.platform_name, "start_execution",
+                "Only approved query optimizations can be executed; cluster recommendations are reporting only.",
+            )
+        return await self.start_analysis("query_apply", {
+            "query_id": action.get("query_id"),
+            "approval_id": action.get("approval_id"),
+            "approved_by": action.get("approved_by"),
+        })
 
     async def validate_execution(self, platform_run_id: str) -> RunStatusResult:
-        raise PlatformCapabilityNotImplemented(
-            self.platform_name, "validate_execution", "Phase 8."
-        )
+        """The apply notebook's real Fabric job status."""
+        return await self.get_run_status(platform_run_id, "query_apply")
 
     async def rollback(self, platform_run_id: str) -> ConnectionResult:
         raise PlatformCapabilityNotImplemented(self.platform_name, "rollback", "Phase 8.")

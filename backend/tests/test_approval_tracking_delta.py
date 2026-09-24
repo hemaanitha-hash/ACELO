@@ -1,6 +1,7 @@
 """
-Approvals sourced from the Fabric `cluster_optimization_tracking` Delta table,
-read directly through OneLake by the Fabric adapter — no SQL analytics endpoint.
+Query approvals sourced from the Validation notebook's `query_tracking_full_v1`
+Delta table, read directly through OneLake by the Fabric adapter — no SQL
+analytics endpoint.
 
 The tables in these tests are REAL Delta tables (written with delta-rs to a temp
 folder); only their location is redirected from OneLake to disk. The adapter's
@@ -23,35 +24,39 @@ from services import approval_service, provisioning_service
 
 WORKSPACE_ID = "0a0a0a0a-1111-2222-3333-444444444444"
 LAKEHOUSE_ID = "1b1b1b1b-2222-3333-4444-555555555555"
+TABLE = "query_tracking_full_v1"
 ACTOR = {"X-Acelo-User-Id": "oid-1", "X-Acelo-User-Name": "Priya Reviewer"}
 ONELAKE = {"X-OneLake-Token": "eyJ-ONELAKE-STORAGE-TOKEN"}
 
 
+def _q(query_id, status, **extra):
+    row = {"query_id": query_id, "query_text": f"SELECT * FROM t WHERE k = '{query_id}'", "query_type": "SELECT",
+           "confidence": "HIGH", "bottleneck_type": "DISK_SPILL", "primary_action": f"Reduce spill for {query_id}",
+           "root_cause": "Large shuffle join", "actual_cost_usd": 9.5, "potential_savings_usd": 3.25,
+           "llm_refactor_suggestion": f"```sql\nSELECT k FROM t WHERE k = '{query_id}'\n```",
+           "workflow_status": status, "send_to": None, "optimized_cost_usd": 0.001, "savings_percentage": 38.0,
+           "updated_at": datetime(2026, 9, 21, 10, 0)}
+    row.update(extra)
+    return row
+
+
 def tracking_rows():
-    """Rows exactly as the legacy tracking MERGE writes them (incl. its email columns)."""
+    """Rows as Validation.ipynb leaves them (incl. the retired email flow's send_to column)."""
     return [
-        {"cluster_name": "etl-heavy", "optimization_label": "Risky", "current_workers": 8,
-         "recommended_max_workers": 5, "total_dbus_cost_usd": 1200.5, "potential_monthly_savings": 340.25,
-         "llm_optimization": "Reduce max workers to 5.", "status": "PENDING", "send_to": None,
-         "email_sent_at": None, "updated_at": datetime(2026, 9, 21, 10, 0)},
-        {"cluster_name": "bi-adhoc", "optimization_label": "Moderately Optimized", "current_workers": 6,
-         "recommended_max_workers": 5, "total_dbus_cost_usd": 800.0, "potential_monthly_savings": 0.0,
-         "llm_optimization": None, "status": "SENT", "send_to": "someone", "email_sent_at": datetime(2026, 9, 20),
-         "updated_at": datetime(2026, 9, 20, 9, 0)},
-        {"cluster_name": "ml-train", "optimization_label": "Optimized", "current_workers": 4,
-         "recommended_max_workers": 4, "total_dbus_cost_usd": 300.0, "potential_monthly_savings": 10.0,
-         "llm_optimization": None, "status": "PENDING", "send_to": None, "email_sent_at": None,
-         "updated_at": datetime(2026, 9, 21, 10, 0)},
+        _q("q-100", "verified"),
+        _q("q-200", "SENT", potential_savings_usd=0.0, primary_action=None, send_to="someone"),
+        _q("q-300", "pending"),  # not validated yet -> not an approval item
     ]
 
 
 def write_table(path, rows):
     schema = pa.schema([
-        ("cluster_name", pa.string()), ("optimization_label", pa.string()),
-        ("current_workers", pa.int32()), ("recommended_max_workers", pa.int32()),
-        ("total_dbus_cost_usd", pa.float64()), ("potential_monthly_savings", pa.float64()),
-        ("llm_optimization", pa.string()), ("status", pa.string()), ("send_to", pa.string()),
-        ("email_sent_at", pa.timestamp("us")), ("updated_at", pa.timestamp("us")),
+        ("query_id", pa.string()), ("query_text", pa.string()), ("query_type", pa.string()),
+        ("confidence", pa.string()), ("bottleneck_type", pa.string()), ("primary_action", pa.string()),
+        ("root_cause", pa.string()), ("actual_cost_usd", pa.float64()), ("potential_savings_usd", pa.float64()),
+        ("llm_refactor_suggestion", pa.string()), ("workflow_status", pa.string()), ("send_to", pa.string()),
+        ("optimized_cost_usd", pa.float64()), ("savings_percentage", pa.float64()),
+        ("updated_at", pa.timestamp("us")),
     ])
     write_deltalake(str(path), pa.Table.from_pylist(rows, schema=schema), mode="overwrite")
 
@@ -76,7 +81,9 @@ def env(db_session, customer):
             "cluster_lakehouse_id": LAKEHOUSE_ID,
             "lakehouse_database": "Data",
             "cluster_result_schema": "dbo",
-            "cluster_approval_tracking_table": "cluster_optimization_tracking",
+            # Query has its OWN mapping; it never borrows the Cluster Lakehouse.
+            "query_lakehouse_id": LAKEHOUSE_ID,
+            "query_result_schema": "dbo",
             # Deliberately NO sql_endpoint: approvals must not need it.
         }),
         status="connected",
@@ -95,7 +102,7 @@ def env(db_session, customer):
 @pytest.fixture
 def delta(tmp_path, monkeypatch):
     """Points the adapter's OneLake location at a real local Delta table."""
-    table_path = tmp_path / "cluster_optimization_tracking"
+    table_path = tmp_path / TABLE
     write_table(table_path, tracking_rows())
     seen = {}
 
@@ -121,81 +128,99 @@ def test_real_delta_records_appear_in_approvals(client, customer, env, delta, db
     resp = _refresh(client, customer)
     assert resp.status_code == 200
     source = resp.json()["sources"][0]
-    assert source == {"environment_id": "env-trk", "table": "cluster_optimization_tracking", "status": "ok",
-                      "rows_read": 3, "candidates": 2, "created": 2, "skipped": 1}
+    assert source.items() >= {"environment_id": "env-trk", "table": TABLE, "status": "ok",
+                              "rows_read": 3, "candidates": 2, "created": 2, "skipped": 1}.items()
+    assert source["unique_business_keys"] == 2 and source["updated"] == 0
     # Read from the configured workspace/lakehouse/schema with the user's OneLake token.
-    assert seen == {"workspace_id": WORKSPACE_ID, "lakehouse_id": LAKEHOUSE_ID,
-                    "table": "cluster_optimization_tracking", "schema": "dbo",
-                    "token": "eyJ-ONELAKE-STORAGE-TOKEN"}
+    assert seen == {"workspace_id": WORKSPACE_ID, "lakehouse_id": LAKEHOUSE_ID, "table": TABLE,
+                    "schema": "dbo", "token": "eyJ-ONELAKE-STORAGE-TOKEN"}
 
-    by_name = {a["resource_name"]: a for a in _list(client, customer)}
-    assert set(by_name) == {"etl-heavy", "bi-adhoc"}  # "Optimized" is not a candidate
-    etl = by_name["etl-heavy"]
-    assert etl["source"] == "tracking_table" and etl["environment_id"] == "env-trk"
-    assert etl["current_workers"] == 8 and etl["recommended_max_workers"] == 5
-    assert etl["total_dbus_cost_usd"] == 1200.5 and etl["potential_monthly_savings"] == 340.25
-    assert etl["llm_optimization"] == "Reduce max workers to 5."
-    assert etl["evidence"]["tracking_updated_at"].startswith("2026-09-21")
+    by_id = {a["resource_name"]: a for a in _list(client, customer)}
+    assert set(by_id) == {"q-100", "q-200"}  # 'pending' is not validated yet
+    q = by_id["q-100"]
+    assert q["source"] == "tracking_table" and q["environment_id"] == "env-trk" and q["domain"] == "query"
+    assert q["original_sql"] == "SELECT * FROM t WHERE k = 'q-100'"
+    assert q["optimized_sql"] == "SELECT k FROM t WHERE k = 'q-100'"
+    assert q["platform_validation_status"] == "verified"
+    assert q["total_dbus_cost_usd"] == 9.5 and q["potential_monthly_savings"] == 3.25
+    assert q["evidence"]["savings_percentage"] == 38.0
+    assert q["evidence"]["tracking_updated_at"].startswith("2026-09-21")
 
 
 def test_pending_records_are_shown_and_email_state_is_ignored(client, customer, env, delta):
     _refresh(client, customer)
     pending = _list(client, customer, status="PENDING")
-    # "SENT" only meant "emailed" in the legacy flow — it is not a decision.
-    assert {a["resource_name"] for a in pending} == {"etl-heavy", "bi-adhoc"}
-    assert {a["tracking_status"] for a in pending} == {"PENDING", "SENT"}
+    # "SENT" only meant "verified and emailed" in the retired flow — it is not a decision.
+    assert {a["resource_name"] for a in pending} == {"q-100", "q-200"}
+    assert {a["tracking_status"] for a in pending} == {"verified", "SENT"}
     for approval in pending:
-        assert "send_to" not in approval and "email_sent_at" not in approval
-        assert "send_to" not in approval["evidence"] and "email_sent_at" not in approval["evidence"]
+        assert "send_to" not in approval and "send_to" not in approval["evidence"]
 
 
 def test_real_zero_and_missing_values(client, customer, env, delta):
     _refresh(client, customer)
-    bi = next(a for a in _list(client, customer) if a["resource_name"] == "bi-adhoc")
-    assert bi["potential_monthly_savings"] == 0
-    assert bi["llm_optimization"] is None
+    q = next(a for a in _list(client, customer) if a["resource_name"] == "q-200")
+    assert q["potential_monthly_savings"] == 0
+    assert q["llm_optimization"] is None
 
 
 def test_approve_and_reject_persist(client, customer, env, delta, db_session):
     _refresh(client, customer)
-    by_name = {a["resource_name"]: a for a in _list(client, customer)}
-    approved = client.post(f"/api/approvals/{by_name['etl-heavy']['approval_id']}/approve",
+    by_id = {a["resource_name"]: a for a in _list(client, customer)}
+    approved = client.post(f"/api/approvals/{by_id['q-100']['approval_id']}/approve",
                            headers={"X-Customer-Id": customer.id, **ACTOR}).json()
     assert approved["status"] == "APPROVED" and approved["approved_by"] == "Priya Reviewer"
 
-    no_reason = client.post(f"/api/approvals/{by_name['bi-adhoc']['approval_id']}/reject", json={},
+    no_reason = client.post(f"/api/approvals/{by_id['q-200']['approval_id']}/reject", json={},
                             headers={"X-Customer-Id": customer.id, **ACTOR})
     assert no_reason.status_code == 422
-    rejected = client.post(f"/api/approvals/{by_name['bi-adhoc']['approval_id']}/reject",
-                           json={"reason": "Owner requested a freeze"},
+    rejected = client.post(f"/api/approvals/{by_id['q-200']['approval_id']}/reject",
+                           json={"reason": "Changes NULL handling"},
                            headers={"X-Customer-Id": customer.id, **ACTOR}).json()
     assert rejected["status"] == "REJECTED"
 
     db_session.expire_all()
     stored = {a.resource_name: a for a in db_session.query(OptimizationApproval).all()}
-    assert stored["etl-heavy"].status == "APPROVED"
-    assert stored["bi-adhoc"].rejection_reason == "Owner requested a freeze"
+    assert stored["q-100"].status == "APPROVED"
+    assert stored["q-200"].rejection_reason == "Changes NULL handling"
+    assert stored["q-200"].original_sql and stored["q-200"].optimized_sql
     actions = [a.action for a in db_session.query(ApprovalAudit).order_by(ApprovalAudit.timestamp)]
     assert actions.count("CREATED") == 2 and "APPROVED" in actions and "REJECTED" in actions
 
 
 def test_repeated_refresh_never_duplicates_or_resets(client, customer, env, delta, db_session):
     _refresh(client, customer)
-    etl = next(a for a in _list(client, customer) if a["resource_name"] == "etl-heavy")
-    client.post(f"/api/approvals/{etl['approval_id']}/approve", headers={"X-Customer-Id": customer.id, **ACTOR})
+    q = next(a for a in _list(client, customer) if a["resource_name"] == "q-100")
+    client.post(f"/api/approvals/{q['approval_id']}/approve", headers={"X-Customer-Id": customer.id, **ACTOR})
 
     for _ in range(3):
         again = _refresh(client, customer).json()["sources"][0]
         assert again["created"] == 0
     assert db_session.query(OptimizationApproval).count() == 2
-    assert next(a for a in _list(client, customer) if a["resource_name"] == "etl-heavy")["status"] == "APPROVED"
+    assert next(a for a in _list(client, customer) if a["resource_name"] == "q-100")["status"] == "APPROVED"
+
+
+def test_117_then_119_then_119(client, customer, env, delta, db_session):
+    """The spec's scenario: 117 items, same 117 again (0 new), then 2 genuinely new (119, not re-created)."""
+    path, _ = delta
+    base = [_q(f"q-{i}", "verified") for i in range(117)]
+    write_table(path, base)
+    assert _refresh(client, customer).json()["sources"][0]["created"] == 117
+    first = next(a for a in _list(client, customer) if a["resource_name"] == "q-5")
+    client.post(f"/api/approvals/{first['approval_id']}/approve", headers={"X-Customer-Id": customer.id, **ACTOR})
+    again = _refresh(client, customer).json()["sources"][0]
+    assert again["created"] == 0 and again["unique_business_keys"] == 117
+    write_table(path, base + [_q("q-new-1", "verified"), _q("q-new-2", "review_required")])
+    more = _refresh(client, customer).json()["sources"][0]
+    assert more["created"] == 2
+    assert db_session.query(OptimizationApproval).count() == 119
+    assert next(a for a in _list(client, customer) if a["resource_name"] == "q-5")["status"] == "APPROVED"
 
 
 def test_new_tracking_rows_are_added_on_refresh(client, customer, env, delta):
     path, _ = delta
     _refresh(client, customer)
-    rows = tracking_rows() + [{**tracking_rows()[0], "cluster_name": "stream-x"}]
-    write_table(path, rows)
+    write_table(path, tracking_rows() + [_q("q-400", "review_required")])
     assert _refresh(client, customer).json()["sources"][0]["created"] == 1
     assert len(_list(client, customer)) == 3
 
@@ -220,7 +245,7 @@ def test_missing_table_is_a_clear_error_and_creates_nothing(client, customer, en
     source = body["sources"][0]
     assert source["status"] == "failed"
     assert source["error_code"] == "RESOURCE_NOT_FOUND"
-    assert "cluster_optimization_tracking" in source["message"]
+    assert TABLE in source["message"]
     assert db_session.query(OptimizationApproval).count() == 0
     assert _list(client, customer) == []
 
@@ -232,21 +257,16 @@ def test_no_onelake_token_is_a_sign_in_error_not_a_fallback(client, customer, en
     assert db_session.query(OptimizationApproval).count() == 0
 
 
-def test_unconfigured_tracking_table_is_reported(client, customer, env, db_session):
-    connection, _ = env
-    metadata = json.loads(connection.auth_metadata)
-    metadata.pop("cluster_approval_tracking_table")
-    connection.auth_metadata = json.dumps(metadata)
-    db_session.commit()
+def test_no_fabric_environment_is_reported(client, customer, db_session):
     resp = _refresh(client, customer)
     assert resp.status_code == 409
-    assert "tracking table is configured" in resp.json()["detail"]
+    assert "No Fabric environment" in resp.json()["detail"]
 
 
 def test_missing_lakehouse_is_reported(client, customer, env, db_session):
     connection, _ = env
     metadata = json.loads(connection.auth_metadata)
-    metadata.pop("cluster_lakehouse_id")
+    metadata.pop("query_lakehouse_id")
     connection.auth_metadata = json.dumps(metadata)
     db_session.commit()
     source = _refresh(client, customer).json()["sources"][0]

@@ -322,8 +322,11 @@ class OptimizationApproval(Base):
     review in ACELO. Created only from result rows the optimizer produced —
     never seeded, never emailed.
 
-    Identity is (customer_id, acelo_run_id, resource_id): re-reading the same
-    run's results can never create a second record for the same cluster.
+    CURRENT STATE, not history: exactly one record per business key
+    (environment_id, domain, resource_id), stored in `source_ref` as
+    "current:<environment>|<domain>|<resource>" and unique per customer. Every
+    run that produces the same cluster UPDATES that record; run history lives
+    in job_runs / job_logs, decision history in approval_audit.
     Numeric fields are nullable so a value the result did not carry stays
     "unknown" rather than becoming 0.
     """
@@ -371,6 +374,22 @@ class OptimizationApproval(Base):
     validation_status = Column(String, nullable=True)  # "pending" | "passed" | "failed"
     execution_error = Column(Text, nullable=True)
 
+    # Current-state bookkeeping. One record per business key (see source_ref);
+    # every execution that produced this recommendation is recorded here and in
+    # approval_audit, never as a second record.
+    last_seen_run_id = Column(String, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    # A decided record whose latest run produced a DIFFERENT recommendation:
+    # the decision is kept, the new values wait here until a reviewer reopens it.
+    requires_new_approval = Column(Boolean, default=False)
+    latest_recommendation_json = Column(Text, nullable=True)
+
+    # Query optimization items (domain="query"): the SQL under review and the
+    # Validation notebook's own verdict (verified / review_required).
+    original_sql = Column(Text, nullable=True)
+    optimized_sql = Column(Text, nullable=True)
+    platform_validation_status = Column(String, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -392,3 +411,84 @@ class ApprovalAudit(Base):
     new_status = Column(String, nullable=False)
     reason = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class ClusterRecommendation(Base):
+    """
+    CURRENT cluster optimization state — analysis/reporting only, no approval.
+
+    One row per (customer, environment scope, cluster). Every cluster run
+    UPDATES the rows of the clusters it analysed and INSERTS new ones; the runs
+    themselves stay separately in job_runs (append-only history), each with its
+    own full result in job_runs.result_json.
+    """
+
+    __tablename__ = "cluster_recommendations"
+    __table_args__ = (
+        UniqueConstraint("customer_id", "environment_key", "cluster_id", name="uq_cluster_rec_entity"),
+    )
+
+    id = Column(String, primary_key=True, default=_id)
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False, index=True)
+    environment_id = Column(String, nullable=True, index=True)
+    # environment_id, or "file-run:<run id>" for uploaded files (each upload is its own scope).
+    environment_key = Column(String, nullable=False)
+    platform = Column(String, nullable=False)
+    cluster_id = Column(String, nullable=False)
+    cluster_name = Column(String, nullable=True)
+    optimization_label = Column(String, nullable=True)  # Optimized / Moderately Optimized / Risky
+    current_workers = Column(Float, nullable=True)
+    recommended_max_workers = Column(Float, nullable=True)
+    avg_cpu_util = Column(Float, nullable=True)
+    avg_memory_util = Column(Float, nullable=True)
+    total_dbus_cost_usd = Column(Float, nullable=True)
+    predicted_cost_usd = Column(Float, nullable=True)
+    predicted_savings_pct = Column(Float, nullable=True)
+    potential_monthly_savings = Column(Float, nullable=True)
+    llm_optimization = Column(Text, nullable=True)
+    evidence_json = Column(Text, nullable=True)
+    first_run_id = Column(String, nullable=True)
+    last_run_id = Column(String, nullable=True, index=True)
+    last_platform_run_id = Column(String, nullable=True)
+    analyzed_at = Column(String, nullable=True)  # the notebook's acelo_analyzed_at
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DomainResource(Base):
+    """
+    Environment Resource Registry: WHAT runs, and WITH WHICH tables, for one
+    optimization domain in one environment.
+
+    One row per (environment, domain). The AI Agent only decides the domain
+    (intent); the backend loads this row to find the notebook/pipeline, the
+    lakehouse, schemas and tables. Cluster, Query and Storage never share a row,
+    so one domain's settings can never reach another domain's notebook.
+    Identifiers only - never credentials.
+    """
+
+    __tablename__ = "environment_domain_resources"
+    __table_args__ = (UniqueConstraint("environment_id", "domain", name="uq_domain_resource"),)
+
+    id = Column(String, primary_key=True, default=_id)
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False, index=True)
+    environment_id = Column(String, ForeignKey("environments.id"), nullable=False, index=True)
+    domain = Column(String, nullable=False)  # cluster | query | storage
+    platform = Column(String, nullable=True)
+    execution_type = Column(String, nullable=True)  # notebook | pipeline
+    pipeline_id = Column(String, nullable=True)  # explicit override; else the ACELO-deployed one
+    notebook_id = Column(String, nullable=True)  # explicit override; else the ACELO-deployed one
+    workspace_id = Column(String, nullable=True)  # blank = the environment's workspace
+    lakehouse_id = Column(String, nullable=True)
+    lakehouse_workspace_id = Column(String, nullable=True)
+    source_lakehouse = Column(String, nullable=True)
+    result_lakehouse = Column(String, nullable=True)
+    source_schema = Column(String, nullable=True)
+    result_schema = Column(String, nullable=True)
+    source_table = Column(String, nullable=True)
+    result_table = Column(String, nullable=True)
+    approval_tracking_table = Column(String, nullable=True)
+    settings_json = Column(Text, nullable=True)  # other non-secret identifiers (column_mapping, key vault names...)
+    migrated_from = Column(String, nullable=True)  # "connection.auth_metadata" when created by migration
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -1,5 +1,18 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
+import {
+  getActiveContext,
+  PLATFORM_LABELS,
+  resolveInitial,
+  setActiveContext,
+  subscribe,
+  type ActiveContext,
+  type ActivePlatformId,
+  type PlatformConnection,
+} from "../services/platformContext";
+import { isDatabricksOnly } from "../services/experience";
+import { getRuntime } from "../services/runtime";
+import { listPlatformConnections } from "../services/platformConnections";
 import {
   LayoutGrid,
   Sparkles,
@@ -15,26 +28,58 @@ import {
   X,
 } from "lucide-react";
 
-const navItems = [
+interface NavItem {
+  to: string;
+  label: string;
+  icon: typeof Database;
+  end?: boolean;
+  badge?: number;
+}
+
+/**
+ * Navigation shared by every platform. The pages are the same; what differs is
+ * the data behind them, which the active platform context decides.
+ */
+const sharedNavItems: NavItem[] = [
   { to: "/", label: "Overview", icon: LayoutGrid, end: true },
   { to: "/agent", label: "AI Agent", icon: Sparkles },
   { to: "/optimizations", label: "Optimizations", icon: SlidersHorizontal },
   { to: "/recommendations", label: "Recommendations", icon: FileText },
-  { to: "/approvals", label: "Approvals", icon: ShieldCheck, badge: 3 },
+  // No badge: the count here was hardcoded to 3, so the sidebar claimed three
+  // pending approvals in every workspace forever. A real count needs a real
+  // request; an invented one is worse than none.
+  { to: "/approvals", label: "Approvals", icon: ShieldCheck },
   { to: "/execution", label: "Execution", icon: PlayCircle },
   { to: "/history", label: "Run History", icon: History },
 ];
 
-const platforms = [
-  {
-    name: "Databricks",
-    workspace: "Production Lakehouse",
-  },
-  {
-    name: "Microsoft Fabric",
-    workspace: "Fabric Workspace",
-  },
+/**
+ * Platform-specific entries. Only the ACTIVE platform's item is rendered — the
+ * Databricks discovery view is never reachable while Fabric is active, and the
+ * route itself refuses to load out of context (see App.tsx).
+ */
+/**
+ * The MVP journey, in order:
+ *   Overview -> AI Agent -> Compute Optimization -> Recommendations
+ *
+ * Approvals, Execution and Run History remain implemented and routable; they
+ * are simply not part of the primary Databricks compute-optimization journey,
+ * so they are kept out of the main navigation rather than deleted.
+ */
+const mvpNavItems: NavItem[] = [
+  { to: "/", label: "Overview", icon: LayoutGrid, end: true },
+  { to: "/agent", label: "AI Agent", icon: Sparkles },
+  { to: "/compute", label: "Compute Optimization", icon: Database },
+  { to: "/recommendations", label: "Recommendations", icon: FileText },
 ];
+
+const platformNavItems: Record<ActivePlatformId, NavItem[]> = {
+  // Databricks has its own discovery page. Fabric's resources are listed inside
+  // Environment Setup, which already has its own entry below — a second link to
+  // the same page read as a separate feature that did not exist.
+  databricks: [{ to: "/databricks", label: "Compute discovery", icon: Database }],
+  fabric: [],
+};
 
 interface SidebarProps {
   open: boolean;
@@ -42,8 +87,38 @@ interface SidebarProps {
 }
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const databricksOnly = isDatabricksOnly();
   const [platformOpen, setPlatformOpen] = useState(false);
-  const [activePlatform, setActivePlatform] = useState(platforms[1]);
+  const [connections, setConnections] = useState<PlatformConnection[]>([]);
+  const [context, setContext] = useState<ActiveContext>(getActiveContext());
+
+  // The switcher lists the customer's REAL connections, not a hardcoded array.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const loaded = await listPlatformConnections();
+        if (cancelled) return;
+        setConnections(loaded);
+        // Adopt a selection only if nothing is active yet, so switching is
+        // never undone by a later refresh.
+        if (!getActiveContext().connection) setActiveContext(resolveInitial(loaded));
+      } catch {
+        /* the switcher stays empty; pages surface their own errors */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => subscribe(setContext), []);
+
+  const activePlatform = context.platform;
+  const activeConnection = context.connection;
+  const navItems: NavItem[] = databricksOnly
+    ? mvpNavItems
+    : [...sharedNavItems, ...(activePlatform ? platformNavItems[activePlatform] : [])];
 
   return (
     <>
@@ -86,7 +161,31 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           </button>
         </div>
 
+        {/* Databricks-only MVP: the workspace comes from the Databricks App
+            runtime, so there is nothing to select. The switcher below exists
+            only for the legacy multi-platform experience. */}
+        {databricksOnly && (
+          <div className="mx-3 mb-4 rounded-sm border border-panel-border bg-panel px-3 py-2.5">
+            <div className="flex items-center gap-2.5">
+              <Database size={15} className="shrink-0 text-ink-muted" />
+              <div className="min-w-0">
+                <span className="block truncate text-sm font-medium leading-tight text-ink">
+                  Databricks
+                </span>
+                <span
+                  data-testid="workspace-context"
+                  className="mt-0.5 block truncate text-xs leading-tight text-ink-faint"
+                >
+                  {getRuntime().workspace_host?.replace("https://", "") ??
+                    "Current Databricks workspace"}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Platform / Environment Selector */}
+        {!databricksOnly && (
         <div className="relative mx-3 mb-4">
           <button
             onClick={() => setPlatformOpen((v) => !v)}
@@ -102,11 +201,11 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
 
               <div className="min-w-0">
                 <span className="block truncate text-sm font-medium leading-tight text-ink">
-                  {activePlatform.name}
+                  {activePlatform ? PLATFORM_LABELS[activePlatform] : "No platform"}
                 </span>
 
                 <span className="mt-0.5 block truncate text-xs leading-tight text-ink-faint">
-                  {activePlatform.workspace}
+                  {activeConnection?.name ?? "No connection"}
                 </span>
               </div>
             </div>
@@ -124,17 +223,18 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
               role="listbox"
               className="absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded-sm border border-panel-border bg-panel shadow-elevated"
             >
-              {platforms.map((platform) => {
-                const isActive =
-                  activePlatform.name === platform.name;
+              {connections.map((platform) => {
+                const isActive = activeConnection?.id === platform.id;
 
                 return (
-                  <li key={platform.name}>
+                  <li key={platform.id}>
                     <button
                       role="option"
                       aria-selected={isActive}
                       onClick={() => {
-                        setActivePlatform(platform);
+                        // Switching platform changes the whole application
+                        // context, not just this label.
+                        setActiveContext(platform);
                         setPlatformOpen(false);
                       }}
                       className={`flex w-full items-center justify-between gap-2 px-3 py-3 text-left transition-colors ${
@@ -151,11 +251,11 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
                               : "text-ink"
                           }`}
                         >
-                          {platform.name}
+                          {PLATFORM_LABELS[platform.platform]}
                         </span>
 
                         <span className="mt-0.5 block truncate text-xs text-ink-faint">
-                          {platform.workspace}
+                          {platform.name}
                         </span>
                       </span>
 
@@ -172,6 +272,8 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
             </ul>
           )}
         </div>
+
+        )}
 
         {/* Navigation */}
         <nav className="flex-1 space-y-0.5 px-3">
@@ -212,29 +314,41 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
 
             <div className="min-w-0">
               <p className="text-[11px] text-ink-faint leading-none">
-                Connected Platform
+                {databricksOnly ? "Connection" : "Connected Platform"}
               </p>
 
               <p className="text-sm text-ink leading-tight mt-0.5">
-                {activePlatform.name}
+                {databricksOnly
+                  ? getRuntime().databricks_app
+                    ? "Connected via Databricks App"
+                    : "Databricks"
+                  : activePlatform
+                    ? PLATFORM_LABELS[activePlatform]
+                    : "None"}
               </p>
             </div>
           </div>
 
-          <NavLink
-            to="/settings"
-            onClick={onClose}
-            className={({ isActive }) =>
-              `flex items-center gap-2.5 rounded-sm px-3 py-2 text-sm transition-colors ${
-                isActive
-                  ? "text-ink bg-panel-hover"
-                  : "text-ink-muted hover:bg-panel-hover hover:text-ink"
-              }`
-            }
-          >
-            <Settings size={16} strokeWidth={1.75} />
-            Settings
-          </NavLink>
+          {/* Environment Setup exists only for the legacy multi-platform
+              experience. A Databricks App runs inside the workspace and
+              authenticates with its own identity, so there is no environment
+              for the user to configure and no link to offer. */}
+          {!databricksOnly && (
+            <NavLink
+              to="/settings"
+              onClick={onClose}
+              className={({ isActive }) =>
+                `flex items-center gap-2.5 rounded-sm px-3 py-2 text-sm transition-colors ${
+                  isActive
+                    ? "text-ink bg-panel-hover"
+                    : "text-ink-muted hover:bg-panel-hover hover:text-ink"
+                }`
+              }
+            >
+              <Settings size={16} strokeWidth={1.75} />
+              Settings
+            </NavLink>
+          )}
         </div>
       </aside>
     </>

@@ -9,9 +9,8 @@
 // The browser never holds a platform credential. client_secret is write-only on
 // the way in, and no response type below has a field that could carry one back.
 // ============================================================================
-
-const API_BASE =
-  (import.meta.env?.VITE_API_BASE as string | undefined) ?? "http://localhost:8000/api";
+import { platformHeaders } from "./platformContext";
+import { API_BASE } from "./apiBase";
 
 export type EnvironmentPlatform = "fabric" | "databricks" | "file";
 
@@ -58,11 +57,34 @@ export interface DiscoveredItem {
   type: string;
 }
 
+/**
+ * One resource type's outcome. This is what separates "the platform returned
+ * zero of these" from "we could not read them" — a distinction the UI must
+ * keep, or a refused endpoint looks identical to an empty workspace.
+ */
+export interface ResourceDiscoveryState {
+  resource_type: string;
+  state:
+    | "SUCCESS_WITH_RESOURCES"
+    | "SUCCESS_EMPTY"
+    | "AUTHENTICATION_FAILED"
+    | "AUTHORIZATION_FAILED"
+    | "NOT_SUPPORTED"
+    | "API_ERROR";
+  resource_count: number;
+  method?: string | null;
+  path?: string | null;
+  status_code?: number | null;
+  platform_error_code?: string | null;
+  platform_message?: string | null;
+}
+
 export interface DiscoveryResult {
   discovered: boolean;
   workspace?: { id: string; name: string } | null;
   items: DiscoveredItem[];
   counts: Record<string, number>;
+  resource_states?: ResourceDiscoveryState[];
   discovered_at?: string | null;
   error_code?: string | null;
   message?: string | null;
@@ -129,12 +151,28 @@ export function fabricTokenHeader(token?: string | null): Record<string, string>
   return token ? { "X-Fabric-Access-Token": token } : {};
 }
 
+/**
+ * The signed-in user's identity (names/ids only, never a token), sent so the
+ * backend can decide who may change administrator configuration.
+ */
+let identityHeaders: Record<string, string> = {};
+
+export function setRequestIdentity(account: { localAccountId?: string; username?: string; name?: string } | null) {
+  identityHeaders = account
+    ? {
+        ...(account.localAccountId ? { "X-Acelo-User-Id": account.localAccountId } : {}),
+        ...(account.username ? { "X-Acelo-User-Email": account.username } : {}),
+        ...(account.name ? { "X-Acelo-User-Name": account.name } : {}),
+      }
+    : {};
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
       ...options,
-      headers: { "Content-Type": "application/json", ...options?.headers },
+      headers: { "Content-Type": "application/json", ...identityHeaders, ...platformHeaders(), ...options?.headers },
     });
   } catch {
     // Network-level failure. Surfaced, never swallowed into a demo result.
@@ -397,6 +435,48 @@ export function saveClusterSettings(
   // Blank means "not configured": sent as "" so the backend removes the value
   // (it then reads back as null). Nothing is ever defaulted to a sample.
   return clusterSettingsRequest(`/environments/${id}/cluster-settings`, {
+    method: "PUT",
+    body: JSON.stringify(settings),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Environment Resource Registry: per-domain execution resources (admin only).
+// The AI Agent never asks users for these; it selects the domain from intent.
+// ---------------------------------------------------------------------------
+
+export type OptimizationDomain = "cluster" | "query" | "storage";
+
+export interface DomainResourceStatus {
+  domain: OptimizationDomain;
+  configured: boolean;
+  missing: string[];
+  execution_type: "notebook" | "pipeline";
+  resource: { type: "notebook" | "pipeline"; id: string; name: string | null; source: string | null } | null;
+  settings: Record<string, string | null>;
+  /** "admin" (mapping) or "config" (backend configuration) per value. */
+  sources?: Record<string, string>;
+  /** Query only: whether the LLM API key is present in backend configuration (never the key). */
+  llm_api_key_configured?: boolean;
+}
+
+export interface OptimizationResources {
+  domains: DomainResourceStatus[];
+  pipelines: { id: string; name: string; managed: boolean }[];
+  /** Whether THIS user may change the mapping (administrators only). */
+  access?: { can_configure_resources: boolean; basis: string; user: string | null };
+}
+
+export function getOptimizationResources(id: string): Promise<OptimizationResources> {
+  return request<OptimizationResources>(`/environments/${id}/optimization-resources`);
+}
+
+export function saveOptimizationResources(
+  id: string,
+  domain: OptimizationDomain,
+  settings: Record<string, string>
+): Promise<OptimizationResources> {
+  return request<OptimizationResources>(`/environments/${id}/optimization-resources/${domain}`, {
     method: "PUT",
     body: JSON.stringify(settings),
   });

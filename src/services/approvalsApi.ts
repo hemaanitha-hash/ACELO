@@ -9,9 +9,8 @@
 
 import type { AccountInfo } from "@azure/msal-browser";
 import { ApiError, fabricTokenHeader } from "./environmentApi";
-
-const API_BASE =
-  (import.meta.env?.VITE_API_BASE as string | undefined) ?? "http://localhost:8000/api";
+import { platformHeaders } from "./platformContext";
+import { API_BASE } from "./apiBase";
 
 export const APPROVAL_STATUSES = [
   "PENDING",
@@ -68,6 +67,27 @@ export interface Approval {
   validation_status: string | null;
   execution_error: string | null;
   history?: ApprovalHistoryEntry[];
+  /** Query items: the SQL under review and the Validation notebook verdict. */
+  original_sql?: string | null;
+  optimized_sql?: string | null;
+  platform_validation_status?: "verified" | "review_required" | null;
+  /** Current-state identity: environment + optimization + entity. */
+  business_key?: string | null;
+  /** The latest execution that produced this recommendation. */
+  last_seen_run_id?: string | null;
+  last_seen_at?: string | null;
+  /** A decided record whose latest run produced a different recommendation. */
+  requires_new_approval?: boolean;
+  latest_recommendation?: {
+    optimization_label: string | null;
+    current_workers: number | null;
+    recommended_max_workers: number | null;
+    total_dbus_cost_usd: number | null;
+    potential_monthly_savings: number | null;
+    llm_optimization: string | null;
+    run_id: string | null;
+    source?: string;
+  } | null;
 }
 
 export type ApprovalSummary = Record<ApprovalStatus, number>;
@@ -90,7 +110,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   try {
     res = await fetch(`${API_BASE}${path}`, {
       ...options,
-      headers: { "Content-Type": "application/json", ...options?.headers },
+      headers: { "Content-Type": "application/json", ...platformHeaders(), ...options?.headers },
     });
   } catch {
     throw new ApiError("Could not reach the ACELO backend. Check that the API is running.", 0);
@@ -140,6 +160,15 @@ export async function approve(id: string, reviewer: Reviewer | null) {
   });
 }
 
+/** Explicitly starts a new approval cycle with the latest recommendation. */
+export async function reopen(id: string, reviewer: Reviewer | null) {
+  return request<Approval>(`/approvals/${id}/reopen`, {
+    method: "POST",
+    headers: actorHeaders(reviewer),
+    body: "{}",
+  });
+}
+
 export async function reject(id: string, reviewer: Reviewer | null, reason: string) {
   return request<Approval>(`/approvals/${id}/reject`, {
     method: "POST",
@@ -164,6 +193,11 @@ export interface TrackingSource {
   rows_read?: number;
   candidates?: number;
   created?: number;
+  updated?: number;
+  unchanged?: number;
+  unique_business_keys?: number;
+  duplicates_removed?: number;
+  requires_new_approval?: number;
   error_code?: string;
   message?: string;
 }

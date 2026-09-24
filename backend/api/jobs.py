@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from agent.orchestrator import start_agent_job
+from agent.orchestrator import UnclearIntent, start_agent_job
 from api.deps import get_current_customer
 from api.environments import fabric_access_token, fabric_sql_token
 from database import get_db
@@ -45,7 +45,10 @@ async def create_job(
     created_by: str | None = Depends(user_name),
 ):
     connection = _get_connection_or_404(db, payload.connection_id, customer.id)
-    job = await start_agent_job(db, customer.id, connection, payload.prompt, delegated_token)
+    try:
+        job = await start_agent_job(db, customer.id, connection, payload.prompt, delegated_token)
+    except UnclearIntent as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
     # The backend owns the run from here: the worker follows each accepted run
     # to completion (with the user's tokens held in memory for delegated mode),
@@ -159,9 +162,8 @@ async def get_job_results(
                 db, connection, run, delegated_token, sql_token, onelake_token=lake_token
             )
         elif payload is not None:
-            # Results stored before approvals existed still get their approvals;
-            # idempotent, so repeated reads never duplicate them.
-            approval_service.safe_sync(db, run, payload)
+            # Idempotent current-state update (cluster state / query items).
+            job_service.route_result(db, run, payload)
 
         results.append(
             JobResultOut(

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from agent.orchestrator import start_agent_job
 from api.deps import get_current_customer
+from api.platform_context import ActivePlatform, active_context
 from api.environments import fabric_access_token
 from database import get_db
 from models import AnalysisJob, Connection, Customer, Environment, JobLog, JobRun, Notification
@@ -148,8 +149,13 @@ def list_runs(
     offset: int = 0,
     db: Session = Depends(get_db),
     customer: Customer = Depends(get_current_customer),
+    context: ActivePlatform = Depends(active_context),
 ):
     query = _customer_runs(db, customer.id)
+    # Run History belongs to the platform the user is in. An explicit ?platform
+    # still wins, so a caller can ask for the other one deliberately.
+    if not platform and context.platform:
+        platform = context.platform
     if status:
         values = _STATUS_FILTER.get(status.upper())
         if values is None:

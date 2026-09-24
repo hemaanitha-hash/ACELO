@@ -142,7 +142,7 @@ describe("AI Agent -> Fabric Cluster run", () => {
 
     expect(await screen.findByText("cluster — Starting")).toBeInTheDocument();
     expect(screen.getByTestId("platform-run-id")).toHaveTextContent(FABRIC_RUN_ID);
-    expect(screen.getByText(/Fabric Run ID/)).toBeInTheDocument();
+    expect(screen.getByText(/Platform run ID/)).toBeInTheDocument();
 
     await act(() => vi.advanceTimersByTimeAsync(3000));
     expect(await screen.findByText("cluster — Running")).toBeInTheDocument();

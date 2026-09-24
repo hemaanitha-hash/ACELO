@@ -16,13 +16,6 @@ import {
   type ClusterResultRow,
   type ParameterVerification,
 } from "../services/executionApi";
-import {
-  listApprovals,
-  requiresApproval,
-  sendToApproval,
-  STATUS_TEXT,
-  type Approval,
-} from "../services/approvalsApi";
 
 /**
  * Cluster optimization results.
@@ -102,38 +95,6 @@ export default function Results() {
   );
 
   const isFile = result?.platform === "file";
-
-  // Approval state per cluster for THIS run, from the real approval records.
-  const [approvalsByResource, setApprovalsByResource] = useState<Record<string, Approval>>({});
-  const [approvalError, setApprovalError] = useState<string | null>(null);
-  const [sending, setSending] = useState<string | null>(null);
-
-  async function loadApprovals(runId: string) {
-    try {
-      const rows = await listApprovals({ aceloRunId: runId });
-      setApprovalsByResource(Object.fromEntries(rows.map((a) => [a.resource_id, a])));
-    } catch {
-      setApprovalError("Approval status could not be loaded.");
-    }
-  }
-
-  useEffect(() => {
-    if (result?.runId) void loadApprovals(result.runId);
-  }, [result?.runId]);
-
-  async function handleSendToApproval(resourceId: string) {
-    if (!result) return;
-    setSending(resourceId);
-    setApprovalError(null);
-    try {
-      await sendToApproval(result.runId, resourceId);
-      await loadApprovals(result.runId);
-    } catch (e: unknown) {
-      setApprovalError(e instanceof ApiError ? e.message : "Approval could not be saved. Please try again.");
-    } finally {
-      setSending(null);
-    }
-  }
 
   return (
     <Layout pageName="Results">
@@ -316,9 +277,6 @@ export default function Results() {
                   ))}
                 </div>
               </div>
-              {approvalError && (
-                <p data-testid="approval-error" className="mb-3 text-xs text-signal-high">{approvalError}</p>
-              )}
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-sm">
                   <thead>
@@ -336,7 +294,7 @@ export default function Results() {
                       <th className="py-2 pr-4 font-medium">Efficiency</th>
                       <th className="py-2 pr-4 font-medium">Cost</th>
                       <th className="py-2 pr-4 font-medium">Savings / mo</th>
-                      <th className="py-2 pr-4 font-medium">Approval</th>
+                      <th className="py-2 pr-4 font-medium">Optimized cost</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -379,14 +337,10 @@ export default function Results() {
                             ? usd(row.potential_monthly_savings)
                             : "—"}
                         </td>
-                        <td className="py-2 pr-4 text-xs">
-                          <ApprovalCell
-                            row={row}
-                            approval={approvalsByResource[resourceIdOf(row)]}
-                            sending={sending === resourceIdOf(row)}
-                            onSend={() => void handleSendToApproval(resourceIdOf(row))}
-                            onOpen={(id) => navigate(`/approvals/${id}`)}
-                          />
+                        <td className="tabular py-2 pr-4 text-ink-muted" title="Current cost minus the notebook's potential savings">
+                          {typeof row.total_dbus_cost_usd === "number" && typeof row.potential_monthly_savings === "number"
+                            ? usd(row.total_dbus_cost_usd - row.potential_monthly_savings)
+                            : "—"}
                         </td>
                       </tr>
                     ))}
@@ -465,48 +419,6 @@ export default function Results() {
 }
 
 /** Same identity the backend uses for approvals: cluster_id, else cluster_name. */
-function resourceIdOf(row: ClusterResultRow): string {
-  return String(row.cluster_id ?? "").trim() || String(row.cluster_name ?? "").trim();
-}
-
-function ApprovalCell({
-  row,
-  approval,
-  sending,
-  onSend,
-  onOpen,
-}: {
-  row: ClusterResultRow;
-  approval: Approval | undefined;
-  sending: boolean;
-  onSend: () => void;
-  onOpen: (approvalId: string) => void;
-}) {
-  if (approval) {
-    return (
-      <button
-        type="button"
-        data-testid="approval-status"
-        onClick={() => onOpen(approval.approval_id)}
-        className="font-medium text-brand-500 hover:underline"
-      >
-        {STATUS_TEXT[approval.status]}
-      </button>
-    );
-  }
-  if (!requiresApproval(row)) return <span className="text-ink-faint">Not required</span>;
-  return (
-    <button
-      type="button"
-      onClick={onSend}
-      disabled={sending}
-      className="rounded-sm border border-brand-500 px-2 py-0.5 font-medium text-brand-500 hover:bg-brand-500/10 disabled:opacity-50"
-    >
-      {sending ? "Sending..." : "Send to Approval"}
-    </button>
-  );
-}
-
 function num(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }

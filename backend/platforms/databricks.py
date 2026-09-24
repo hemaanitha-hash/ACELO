@@ -1,5 +1,6 @@
+import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
@@ -16,7 +17,13 @@ from platforms.base import (
     RunStatusResult,
     StartAnalysisResult,
 )
+from platforms import databricks_auth
 from platforms.errors import ErrorCode, PlatformError, code_for_status
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:  # import cycle: databricks_discovery imports nothing from here at runtime
+    from platforms.databricks_resources import ResourceDiscovery
 
 # Existing Databricks jobs are resolved by NAME, not hardcoded job_id, so the
 # same adapter works across customer workspaces where these jobs already exist
@@ -58,7 +65,33 @@ class DatabricksAdapter(PlatformAdapter):
     platform_name = "databricks"
 
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.secret}", "Content-Type": "application/json"}
+        """
+        The Authorization header for this call.
+
+        A stored PAT wins, so every existing configured connection behaves
+        exactly as before. Only when there is no stored secret does ACELO fall
+        back to the Databricks App's own identity — which is how the App
+        deployment authenticates without the user entering anything.
+        """
+        if self.secret:
+            return {"Authorization": f"Bearer {self.secret}", "Content-Type": "application/json"}
+
+        app_headers = databricks_auth.app_auth_headers()
+        if app_headers:
+            return {**app_headers, "Content-Type": "application/json"}
+
+        # No credential at all. _require_config() reports this as NOT_CONFIGURED
+        # rather than letting an unauthenticated request reach the platform.
+        return {"Content-Type": "application/json"}
+
+    @property
+    def _endpoint(self) -> str:
+        """
+        The workspace to call. A configured endpoint wins; otherwise the App
+        runtime already knows which workspace it is in, so the user never
+        supplies a URL.
+        """
+        return self.endpoint or (databricks_auth.app_host() or "")
 
     async def connect(self) -> ConnectionResult:
         return await self.test_connection()
@@ -95,10 +128,17 @@ class DatabricksAdapter(PlatformAdapter):
     # this reports NOT_CONFIGURED - it never reports a connection it did not make.
 
     def _require_config(self) -> None:
+        """
+        Confirms ACELO can reach this workspace at all.
+
+        Either half may come from the App runtime instead of stored
+        configuration, so both are checked against the resolved values rather
+        than the constructor arguments.
+        """
         missing = []
-        if not self.endpoint:
+        if not self._endpoint:
             missing.append("workspace_url")
-        if not self.secret:
+        if not self.secret and not databricks_auth.app_auth_headers():
             missing.append("access_token")
         if missing:
             raise PlatformError(
@@ -108,7 +148,7 @@ class DatabricksAdapter(PlatformAdapter):
             )
 
     async def _get_json(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        url = self.endpoint + path
+        url = self._endpoint + path
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.get(url, headers=self._headers(), params=params)
@@ -120,9 +160,25 @@ class DatabricksAdapter(PlatformAdapter):
             ) from exc
 
         if resp.status_code != 200:
+            # Databricks reports failures as {"error_code": ..., "message": ...}.
+            # Both are platform-generated and safe to surface; the request
+            # headers (which hold the PAT) are never read here.
+            platform_error_code = None
+            platform_message = None
+            try:
+                body = resp.json()
+                if isinstance(body, dict):
+                    platform_error_code = body.get("error_code")
+                    platform_message = body.get("message")
+            except ValueError:  # non-JSON error body (HTML error page, empty)
+                pass
+
             raise PlatformError(
                 code_for_status(resp.status_code),
                 log_detail="GET {} -> {}: {}".format(path, resp.status_code, resp.text[:300]),
+                status_code=resp.status_code,
+                platform_error_code=platform_error_code,
+                platform_message=(platform_message or resp.text[:300]) or None,
             )
         return resp.json()
 
@@ -143,8 +199,28 @@ class DatabricksAdapter(PlatformAdapter):
         )
 
     async def discover_workspace(self) -> DiscoveredWorkspace:
+        """
+        Confirms the workspace is reachable and returns its identity.
+
+        The cluster listing is only a reachability probe here — the workspace
+        identity comes from the endpoint itself. So a 403 on that listing must
+        NOT fail workspace discovery: an identity that may not list clusters can
+        still read SQL warehouses, and failing here aborted the entire
+        Environment Discovery before those were ever requested. A credential
+        failure (401) or an unreachable host still fails, as it should.
+        """
         self._require_config()
-        await self._get_json("/api/2.0/clusters/list")
+        try:
+            await self._get_json("/api/2.0/clusters/list")
+        except PlatformError as exc:
+            if exc.code != ErrorCode.PERMISSION_DENIED:
+                raise
+            logger.info(
+                "databricks_workspace_probe_forbidden status=%s detail=%s — continuing, "
+                "workspace identity comes from the endpoint",
+                exc.status_code,
+                exc.log_detail,
+            )
         host = urlparse(self.endpoint).hostname or self.endpoint
         return DiscoveredWorkspace(
             workspace_id=self.auth_metadata.get("workspace_id") or host,
@@ -153,11 +229,33 @@ class DatabricksAdapter(PlatformAdapter):
         )
 
     async def discover_resources(self) -> list[DiscoveredResource]:
-        """Lists the real clusters and jobs visible to this token."""
+        """
+        Lists the real clusters and jobs visible to this token.
+
+        Each listing is independent: a token scoped to clusters but not jobs
+        (or the reverse) still gets the half it may read. Previously ONE
+        refused listing raised and failed the whole environment discovery with
+        a single top-level "identity does not have access" error, which hid the
+        resources the token could actually see. A listing is only fatal when
+        every listing failed — otherwise "no access to jobs" would be
+        indistinguishable from "this workspace is empty".
+        """
         self._require_config()
         resources: list[DiscoveredResource] = []
+        failures: list[PlatformError] = []
 
-        clusters = await self._get_json("/api/2.0/clusters/list")
+        try:
+            clusters = await self._get_json("/api/2.0/clusters/list")
+        except PlatformError as exc:
+            logger.info(
+                "databricks_inventory_listing_unavailable listing=clusters status=%s error_code=%s detail=%s",
+                exc.status_code,
+                exc.code,
+                exc.log_detail,
+            )
+            failures.append(exc)
+            clusters = {}
+
         for cluster in clusters.get("clusters", []):
             resources.append(
                 DiscoveredResource(
@@ -179,7 +277,17 @@ class DatabricksAdapter(PlatformAdapter):
             params: dict[str, Any] = {"limit": 100}
             if page_token:
                 params["page_token"] = page_token
-            body = await self._get_json("/api/2.1/jobs/list", params=params)
+            try:
+                body = await self._get_json("/api/2.1/jobs/list", params=params)
+            except PlatformError as exc:
+                logger.info(
+                    "databricks_inventory_listing_unavailable listing=jobs status=%s error_code=%s detail=%s",
+                    exc.status_code,
+                    exc.code,
+                    exc.log_detail,
+                )
+                failures.append(exc)
+                break
             for job in body.get("jobs", []):
                 settings = job.get("settings", {})
                 resources.append(
@@ -195,7 +303,64 @@ class DatabricksAdapter(PlatformAdapter):
                 break
             seen_tokens.add(page_token)
 
+        # SQL warehouses and serverless compute are part of the workspace
+        # inventory too, and neither appears in clusters/list or jobs/list.
+        # Without this, a workspace whose only compute is serverless plus
+        # warehouses listed as EMPTY — the clusters call honestly returned zero
+        # and nothing ever asked about the rest.
+        #
+        # Reuses the same read-only compute discovery the /api/databricks/
+        # resources endpoint uses, so there is one discovery implementation.
+        compute = await self.discover_compute_resources()
+        from platforms.databricks_discovery import discovery_states
+        from platforms.databricks_resources import ResourceType
+
+        _INVENTORY_TYPE = {
+            ResourceType.SQL_WAREHOUSE: "SQLWarehouse",
+            ResourceType.SERVERLESS_COMPUTE: "ServerlessCompute",
+        }
+        for item in compute.resources:
+            # Classic clusters already came from the clusters/list call above.
+            inventory_type = _INVENTORY_TYPE.get(item.resource_type)
+            if not inventory_type:
+                continue
+            resources.append(
+                DiscoveredResource(
+                    platform_resource_id=item.resource_id,
+                    display_name=item.name or item.resource_id,
+                    resource_type=inventory_type,
+                    detail={"state": item.state, **(item.metadata or {})},
+                )
+            )
+
+        # Per-type states for the caller, so "empty" is only ever reported when
+        # every supported call actually returned zero. Read by
+        # environment_service; carried on the adapter because discover_resources
+        # returns a plain list by contract.
+        self.last_discovery_states = discovery_states(compute)
+
+        # Nothing at all could be listed: that is a real failure, not an empty
+        # workspace, so the first error is surfaced rather than swallowed.
+        # Only when the compute discovery found nothing either — otherwise the
+        # caller has real resources to show.
+        if failures and len(failures) == 2 and not resources:
+            raise failures[0]
+
         return resources
+
+    async def discover_compute_resources(self) -> "ResourceDiscovery":
+        """
+        Read-only capability discovery: classic clusters, serverless compute and
+        SQL warehouses, normalised into the common ACELO resource model.
+
+        Separate from discover_resources() above, which builds the workspace
+        *inventory* (clusters + jobs) that environment setup persists. This one
+        answers "what compute can this identity see, and what could it not
+        look at" and creates nothing.
+        """
+        from platforms.databricks_discovery import discover_compute_resources
+
+        return await discover_compute_resources(self)
 
     async def discover_files(self) -> list[DiscoveredResource]:
         # DBFS/Volumes enumeration is Phase 9. Declared, not faked.

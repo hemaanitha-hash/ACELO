@@ -42,6 +42,7 @@ _PARAMETER_KEYS = (
     "llm_key_vault_uri",
     "llm_secret_name",
     "llm_model_name",
+    "validation_batch_size",
 )
 
 logger = logging.getLogger("acelo.execution")
@@ -105,44 +106,21 @@ def build_run_parameters(
     connection: Connection, job_run: JobRun, db: Session | None = None
 ) -> dict[str, str]:
     """
-    Assembles the parameters the deployed notebook needs.
-
-    Per-domain keys win over shared ones, so a single connection can point each
-    domain at a different source/result table. `acelo_run_id` is what makes a
-    run's result rows individually retrievable.
+    The parameters the selected notebook/pipeline receives for this run, built
+    by the Environment Resource Registry from THIS run's domain only - a Cluster
+    setting can never reach the Query notebook, or the reverse.
     """
-    metadata = json.loads(connection.auth_metadata) if connection.auth_metadata else {}
-    domain = job_run.domain
+    from services import resource_registry
 
-    # The environment backing this connection is authoritative for environment_id;
-    # the connection's own metadata is only a fallback for legacy rows.
-    environment_id = metadata.get("environment_id", "")
+    environment = None
     if db is not None:
         from models import Environment
 
-        environment = (
-            db.query(Environment).filter(Environment.connection_id == connection.id).first()
-        )
-        if environment:
-            environment_id = environment.id
-
-    parameters: dict[str, str] = {
-        "acelo_run_id": job_run.id,
-        "environment_id": environment_id,
-    }
-    for key in _PARAMETER_KEYS:
-        value = metadata.get(f"{domain}_{key}", metadata.get(key))
-        if value:
-            parameters[key] = str(value)
-
-    # The lakehouse the connection already configures doubles as the default
-    # location for both source and result when nothing more specific is set.
-    lakehouse = metadata.get("lakehouse_database")
-    if lakehouse:
-        parameters.setdefault("source_lakehouse", str(lakehouse))
-        parameters.setdefault("result_lakehouse", str(lakehouse))
-
-    return parameters
+        environment = db.query(Environment).filter(Environment.connection_id == connection.id).first()
+    metadata = json.loads(connection.auth_metadata) if connection.auth_metadata else {}
+    return resource_registry.build_runtime_parameters(
+        db, environment, job_run.domain, job_run.id, legacy_metadata=metadata
+    )
 
 
 # Parameters each domain's notebook cannot run without. Checking these before
@@ -202,7 +180,7 @@ def _fail_run(db: Session, job_run: JobRun, message: str, code: str, source: str
 # Parameter names that may carry credential material. Their names are logged so
 # a missing configuration is still diagnosable; their values never are.
 _SENSITIVE_PARAMETERS = frozenset(
-    {"llm_key_vault_uri", "llm_secret_name"}
+    {"llm_key_vault_uri", "llm_secret_name", "llm_api_key"}
 )
 
 
@@ -407,6 +385,7 @@ async def sync_run_status(
 # Pipeline activity -> (stage, event on start, event on success, human label).
 _ACTIVITY_EVENTS = {
     "Run ACELO Cluster Notebook": ("notebook", "NOTEBOOK_STARTED", "NOTEBOOK_COMPLETED", "Cluster notebook"),
+    "Run ACELO Query Notebook": ("notebook", "NOTEBOOK_STARTED", "NOTEBOOK_COMPLETED", "Query notebook"),
     "Update ACELO Approval Tracking": (
         "approval_tracking", "APPROVAL_TRACKING_STARTED", "APPROVAL_TRACKING_COMPLETED", "Approval tracking",
     ),
@@ -519,11 +498,30 @@ async def fetch_and_store_result(
          metadata={"row_count": normalized.get("row_count"), "result_reference": result.result_reference},
          once=True)
 
-    # Flagged clusters become PENDING in-app approvals (idempotent, never fatal).
-    from services import approval_service
-
-    approval_service.safe_sync(db, job_run, normalized)
+    route_result(db, job_run, normalized)
     return normalized
+
+
+def route_result(db: Session, job_run: JobRun, normalized: dict | None) -> None:
+    """
+    Where a completed run's result goes (idempotent, never fatal):
+      * cluster -> current cluster optimization state (reporting only, NO approval)
+      * query   -> query approval items from the Validation tracking table
+    """
+    from services import approval_service, cluster_state
+
+    if job_run.domain == "cluster":
+        cluster_state.safe_upsert(db, job_run, normalized)
+    elif job_run.domain == "query":
+        outcome = approval_service.safe_sync_query(db, job_run, normalized)
+        already = db.query(JobLog).filter(
+            JobLog.job_run_id == job_run.id, JobLog.event_type == "APPROVALS_IMPORTED"
+        ).first()
+        if outcome is not None and already is None:  # one import event per run, even on replay
+            emit(db, job_run, "APPROVALS_IMPORTED",
+                 f"Query optimizations for review: {outcome['unique_business_keys']} — "
+                 f"{outcome['created']} new, {outcome['updated']} updated, {outcome['unchanged']} unchanged.",
+                 level=run_events.SUCCESS, stage="approval_tracking", metadata=outcome, once=True)
 
 
 def normalize_result(job_run: JobRun, connection: Connection, result) -> dict:

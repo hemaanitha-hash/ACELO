@@ -24,3 +24,17 @@ backend/*.sqlite3
 
 # Python cache
 *.pyc
+# Local database backups (scripts/reset_dev_data.py)
+backend/*.db.backup-*
+.env.production
+*.db
+Email.ipynb
+UnhealtyQuery_detection.ipynb
+cluster email fabric (1).ipynb
+# Reference notebooks that contain hard-coded credentials (Gmail app password,
+# Groq API key). They are never deployed; ACELO deploys the generated,
+# secret-free notebooks in optimization_package/query/deploy/. Rotate those
+# credentials and remove them from the files before ever committing them.
+backend/optimization_package/query/Email.ipynb
+backend/optimization_package/query/UnhealtyQuery_detection.ipynb
+backend/optimization_package/cluster/cluster email fabric (1).ipynb

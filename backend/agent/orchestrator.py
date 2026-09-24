@@ -19,7 +19,17 @@ def detect_intent(prompt: str) -> list[str]:
         return ["cluster", "query", "storage"]
 
     matched = [domain for domain, keywords in DOMAIN_KEYWORDS.items() if any(k in lowered for k in keywords)]
-    return matched or ["cluster", "query", "storage"]  # default: analyze everything if intent is unclear
+    if not matched:
+        # Never guess: running every domain for an unclear request mixes domains.
+        raise UnclearIntent(
+            "Tell ACELO what to optimize: clusters (e.g. \"Check my cluster utilization\"), "
+            "queries (\"Find unhealthy queries\") or storage (\"Check storage optimization\")."
+        )
+    return matched
+
+
+class UnclearIntent(ValueError):
+    """The request names no optimization domain; ACELO asks instead of guessing."""
 
 
 FILE_ANALYSIS_DOMAINS = {"cluster"}

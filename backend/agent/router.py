@@ -41,11 +41,13 @@ def build_adapter(
     auth_metadata = json.loads(connection.auth_metadata) if connection.auth_metadata else {}
 
     if db is not None:
-        # A pipeline the user explicitly selected (Cluster Settings) wins over
-        # the one ACELO setup registered; notebooks always come from provisioning.
-        configured_pipelines = {k: v for k, v in auth_metadata.items() if k.endswith("_pipeline_id") and v}
-        auth_metadata.update(_provisioned_resources(db, connection))
-        auth_metadata.update(configured_pipelines)
+        # Domain configuration comes from the Environment Resource Registry:
+        # each domain only ever sees its own notebook/pipeline/tables.
+        environment = db.query(Environment).filter(Environment.connection_id == connection.id).first()
+        if environment is not None:
+            from services import resource_registry
+
+            resource_registry.apply_to_adapter(db, environment, auth_metadata)
 
     adapter = adapter_cls(
         endpoint=connection.endpoint, auth_metadata=auth_metadata, secret=secret

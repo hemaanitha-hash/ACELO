@@ -98,10 +98,25 @@ class PlatformError(Exception):
     the server log and is never serialised into an API response.
     """
 
-    def __init__(self, code: str, message: str | None = None, log_detail: str = "") -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        log_detail: str = "",
+        status_code: int | None = None,
+        platform_error_code: str | None = None,
+        platform_message: str | None = None,
+    ) -> None:
         self.code = code
         self.message = message or _DEFAULT_MESSAGES.get(code, "An unexpected platform error occurred.")
         self.log_detail = log_detail
+        # Structured facts about the underlying call, so a caller can diagnose
+        # WHICH request failed and how without re-parsing `log_detail`. These
+        # carry the platform's own HTTP status and error body — never a request
+        # header, and never a credential.
+        self.status_code = status_code
+        self.platform_error_code = platform_error_code
+        self.platform_message = platform_message
         super().__init__(self.message)
 
 

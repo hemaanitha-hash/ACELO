@@ -9,6 +9,7 @@ import { ApiError } from "../services/environmentApi";
 import { FabricAuthError, getFabricToken } from "../services/fabricAuth";
 import {
   approve,
+  reopen,
   display,
   execute,
   getApproval,
@@ -89,6 +90,19 @@ export default function ApprovalDetail() {
     setActionError(null);
   }
 
+  async function handleReopen() {
+    if (!approval) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      setApproval(await reopen(approval.approval_id, reviewer));
+    } catch (e: unknown) {
+      setActionError(`The new review could not be started. ${e instanceof ApiError ? e.message : ""}`.trim());
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function run(kind: Exclude<Dialog, null>) {
     if (!approval) return;
     setBusy(true);
@@ -143,27 +157,33 @@ export default function ApprovalDetail() {
           <>
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
-                <p className="label-eyebrow">Cluster optimization</p>
-                <h1 className="mt-1 text-display font-semibold text-ink">{a.resource_name}</h1>
+                <p className="label-eyebrow">{a.domain === "query" ? "Query optimization" : "Cluster optimization"}</p>
+                <h1 className="mt-1 text-display font-semibold text-ink">
+                  {a.domain === "query" ? `Query ${a.resource_name}` : a.resource_name}
+                </h1>
               </div>
               <span data-testid="approval-status" className="rounded-sm border border-panel-border px-3 py-1 text-xs font-semibold text-ink">
                 {a.status}
               </span>
             </div>
 
-            <section className="surface p-5">
-              <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                <Field label="Cluster" value={a.resource_name} />
-                <Field label="Optimization Label" value={a.optimization_label ?? "Not available"} />
-                <Field label="Current Workers" value={display(a.current_workers)} />
-                <Field label="Recommended Max Workers" value={display(a.recommended_max_workers)} />
-                <Field label="Current Compute Cost" value={display(a.total_dbus_cost_usd, usd)} />
-                <Field label="Potential Monthly Savings" value={display(a.potential_monthly_savings, usd)} />
-              </dl>
-            </section>
+            {a.domain === "query" ? (
+              <QueryReview a={a} />
+            ) : (
+              <section className="surface p-5">
+                <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  <Field label="Cluster" value={a.resource_name} />
+                  <Field label="Optimization Label" value={a.optimization_label ?? "Not available"} />
+                  <Field label="Current Workers" value={display(a.current_workers)} />
+                  <Field label="Recommended Max Workers" value={display(a.recommended_max_workers)} />
+                  <Field label="Current Compute Cost" value={display(a.total_dbus_cost_usd, usd)} />
+                  <Field label="Potential Monthly Savings" value={display(a.potential_monthly_savings, usd)} />
+                </dl>
+              </section>
+            )}
 
             <section className="surface p-5">
-              <p className="label-eyebrow mb-2">AI / LLM Recommendation</p>
+              <p className="label-eyebrow mb-2">{a.domain === "query" ? "Optimization explanation" : "AI / LLM Recommendation"}</p>
               <p data-testid="llm-recommendation" className="whitespace-pre-line text-sm leading-relaxed text-ink">
                 {a.llm_optimization ?? "Not available"}
               </p>
@@ -193,6 +213,32 @@ export default function ApprovalDetail() {
                 <Field label="Created" value={a.created_at ? new Date(a.created_at).toLocaleString() : "Not available"} />
               </dl>
             </section>
+
+            {a.requires_new_approval && a.latest_recommendation && (
+              <section data-testid="new-recommendation" className="surface border-l-4 border-l-[#D71920] p-5">
+                <p className="text-sm font-semibold text-ink">A newer recommendation is available</p>
+                <p className="mt-1 text-sm text-ink-muted">
+                  A later run produced a different recommendation for this cluster. The current{" "}
+                  {a.status.toLowerCase()} decision still applies to the values above until you start a new review.
+                </p>
+                <dl className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
+                  <Field label="Label" value={a.latest_recommendation.optimization_label ?? "Not available"} />
+                  <Field
+                    label="Recommended max workers"
+                    value={display(a.latest_recommendation.recommended_max_workers)}
+                  />
+                  <Field
+                    label="Potential monthly savings"
+                    value={display(a.latest_recommendation.potential_monthly_savings, usd)}
+                  />
+                </dl>
+                {a.status !== "EXECUTING" && (
+                  <Button className="mt-4" onClick={() => void handleReopen()} disabled={busy}>
+                    Review new recommendation
+                  </Button>
+                )}
+              </section>
+            )}
 
             {/* Actions for the current state only. */}
             <section className="surface p-5">
@@ -350,5 +396,110 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
       <dt className="text-xs uppercase tracking-wide text-ink-muted">{label}</dt>
       <dd className={`mt-1 break-all text-sm text-ink ${mono ? "font-mono text-xs" : ""}`}>{value}</dd>
     </div>
+  );
+}
+
+function numberOf(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function bytes(value: unknown): string {
+  const n = numberOf(value);
+  if (n === null) return "Not available";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
+}
+
+function seconds(value: unknown): string {
+  const n = numberOf(value);
+  return n === null ? "Not available" : `${n.toFixed(2)} s`;
+}
+
+function money(value: unknown): string {
+  const n = numberOf(value);
+  return n === null ? "Not available" : `$${n.toFixed(6)}`;
+}
+
+function flag(value: unknown): string {
+  return value === true || value === "true" ? "Yes" : value === false || value === "false" ? "No" : "Not available";
+}
+
+/** Everything a reviewer needs for a query optimization — real values only. */
+function QueryReview({ a }: { a: Approval }) {
+  const e = a.evidence as Record<string, unknown>;
+  const execMs = numberOf(e.execution_time_ms);
+  const cpuMs = numberOf(e.cpu_time_ms);
+  const validated = numberOf(e.savings_percentage);
+  return (
+    <>
+      <section className="surface p-5">
+        <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <Field label="Query ID" value={a.resource_name} mono />
+          <Field
+            label="Validation status"
+            value={
+              a.platform_validation_status === "verified"
+                ? "Verified"
+                : a.platform_validation_status === "review_required"
+                  ? "Review required"
+                  : "Not available"
+            }
+          />
+          <Field label="Root cause" value={String(e.root_cause || a.optimization_label || "Not available")} />
+          <Field label="Confidence" value={String(e.confidence ?? "Not available")} />
+          <Field label="Predicted cost" value={display(a.total_dbus_cost_usd, usd)} />
+          <Field label="Potential savings" value={display(a.potential_monthly_savings, usd)} />
+          <Field label="Validated savings" value={validated === null ? "Not available" : `${validated.toFixed(2)}%`} />
+          <Field label="Priority" value={String(e.priority ?? "Not available")} />
+        </dl>
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <div className="surface p-5">
+          <p className="label-eyebrow mb-2">Original SQL</p>
+          <pre data-testid="original-sql" className="max-h-96 overflow-auto whitespace-pre-wrap rounded-sm bg-canvas p-3 font-mono text-xs text-ink">
+            {a.original_sql ?? "Not available"}
+          </pre>
+        </div>
+        <div className="surface p-5">
+          <p className="label-eyebrow mb-2">Optimized SQL</p>
+          <pre data-testid="optimized-sql" className="max-h-96 overflow-auto whitespace-pre-wrap rounded-sm bg-canvas p-3 font-mono text-xs text-ink">
+            {a.optimized_sql ?? "Not available"}
+          </pre>
+        </div>
+      </section>
+
+      <section className="surface p-5" data-testid="validation-evidence">
+        <p className="label-eyebrow mb-3">Validation evidence</p>
+        <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <Field label="Original execution time" value={seconds(e.original_duration_seconds)} />
+          <Field label="Optimized execution time" value={seconds(e.optimized_duration_seconds)} />
+          <Field label="Original cost (validation)" value={money(e.original_cost_usd)} />
+          <Field label="Optimized cost (validation)" value={money(e.optimized_cost_usd)} />
+          <Field label="Schema match" value={flag(e.validation_schema_match)} />
+          <Field label="Row count match" value={flag(e.validation_row_count_match)} />
+          <Field label="Validation result" value={String(e.validation_reason ?? "Not available")} />
+        </dl>
+      </section>
+
+      <section className="surface p-5">
+        <p className="label-eyebrow mb-3">Performance (observed)</p>
+        <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+          <Field label="Execution time" value={execMs === null ? "Not available" : `${(execMs / 1000).toFixed(2)} s`} />
+          <Field label="CPU time" value={cpuMs === null ? "Not available" : `${(cpuMs / 1000).toFixed(2)} s`} />
+          <Field label="Bytes scanned" value={bytes(e.bytes_scanned)} />
+          <Field label="Bytes spilled" value={bytes(e.bytes_spilled)} />
+          <Field label="Shuffle bytes" value={bytes(e.shuffle_bytes)} />
+        </dl>
+      </section>
+    </>
   );
 }

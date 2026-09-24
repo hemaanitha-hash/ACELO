@@ -233,8 +233,8 @@ async def provision_environment(
     deployed: list[tuple[package_registry.PackageAsset, dict[str, Any], str | None]] = []
     failed = False
 
-    lakehouse = default_lakehouse(db, environment)
-    spark_environment = fabric_environment(db, environment)
+    lakehouse = default_lakehouse(db, environment, "cluster")
+    spark_environment = fabric_environment(db, environment, "cluster")
     _log(
         environment, "fabric_environment",
         environment_item_id=spark_environment["id"] if spark_environment else "workspace-default",
@@ -259,9 +259,11 @@ async def provision_environment(
 
         _set_state(db, environment, INSTALLING, STEP_DOMAIN.format(domain=asset.domain))
         try:
+            # Each notebook is bound to ITS domain's Lakehouse and Spark environment.
             item, folder_id = await _deploy_asset(
-                adapter, package, asset, root_folder_id, folders_supported, lakehouse,
-                spark_environment,
+                adapter, package, asset, root_folder_id, folders_supported,
+                default_lakehouse(db, environment, asset.domain),
+                fabric_environment(db, environment, asset.domain),
             )
         except PlatformError as exc:
             _log(environment, "domain_failed", domain=asset.domain, error_code=exc.code)
@@ -367,7 +369,29 @@ async def provision_environment(
         if pipeline_outcome.get("status") == "FAILED" and _execution_type(environment, "cluster") == "pipeline":
             failed = True
 
-    detail = {"domains": outcomes, "folders_supported": folders_supported, "pipeline": pipeline_outcome}
+    # ---- Step 7: Query pipeline, orchestrating the Query notebook ------------
+    query_pipeline_outcome: dict[str, Any] | None = None
+    query = next(((a, i, f) for a, i, f in verified if a.domain == "query"), None)
+    if query is not None:
+        _, query_item, query_folder = query
+        try:
+            item = await _deploy_named_pipeline(
+                adapter, package, QUERY_PIPELINE_NAME,
+                adapter.query_pipeline_definition(query_item["id"], environment.workspace_id or ""),
+                query_folder, "runs the ACELO Query notebook",
+            )
+            await adapter.get_item(item["id"])
+            _register_pipeline(db, environment, package, "query", item, query_folder)
+            query_pipeline_outcome = {"status": "VERIFIED", "platform_resource_id": item["id"],
+                                      "display_name": item["displayName"], "notebook_id": query_item["id"]}
+        except Exception as exc:  # noqa: BLE001 - the Query notebook itself stays usable
+            logger.warning("provisioning event=query_pipeline_failed env_id=%s error=%s",
+                           environment.id, type(exc).__name__)
+            query_pipeline_outcome = {"status": "FAILED", "error_code": getattr(exc, "code", ErrorCode.PROVISIONING_FAILED),
+                                      "message": "The ACELO Query pipeline could not be deployed."}
+
+    detail = {"domains": outcomes, "folders_supported": folders_supported, "pipeline": pipeline_outcome,
+              "query_pipeline": query_pipeline_outcome}
 
     if failed:
         # Partial success is still a failure. Successfully deployed items stay
@@ -393,12 +417,28 @@ async def provision_environment(
 
 
 CLUSTER_PIPELINE_NAME = "ACELO_Cluster_Optimization_Pipeline"
+QUERY_PIPELINE_NAME = "ACELO_Query_Optimization_Pipeline"
+STORAGE_PIPELINE_NAME = "ACELO_Storage_Optimization_Pipeline"
+
+
+async def _deploy_named_pipeline(adapter, package, name: str, definition, folder_id, what: str):
+    """Creates the named pipeline, or updates the existing one - never a duplicate."""
+    existing = await adapter.find_item_by_name("DataPipeline", name)
+    if existing:
+        await adapter.update_item_definition(existing["id"], definition)
+        return {"id": existing["id"], "displayName": name}
+    return await adapter.create_item(
+        "DataPipeline", name, definition, folder_id=folder_id,
+        description=f"{package.name} v{package.version} — {what}. Managed by ACELO.",
+    )
 
 
 def _execution_type(environment: Environment, domain: str) -> str:
-    connection = environment.connection
-    metadata = json.loads(connection.auth_metadata) if connection and connection.auth_metadata else {}
-    return "pipeline" if (metadata.get(f"{domain}_execution_type") or "") == "pipeline" else "notebook"
+    from database import SessionLocal
+    from services import resource_registry
+
+    db = Session.object_session(environment) or SessionLocal()
+    return resource_registry.get(db, environment, domain)["execution_type"]
 
 
 async def _deploy_pipeline(
@@ -457,7 +497,7 @@ def _register_pipeline(db, environment, package, domain: str, item, folder_id) -
     return resource
 
 
-def default_lakehouse(db: Session, environment: Environment) -> dict[str, str] | None:
+def default_lakehouse(db: Session, environment: Environment, domain: str = "cluster") -> dict[str, str] | None:
     """
     The lakehouse the deployed notebook must be attached to, resolved from the
     resources discovery actually found — never hardcoded.
@@ -472,38 +512,35 @@ def default_lakehouse(db: Session, environment: Environment) -> dict[str, str] |
       3. The only Lakehouse in the workspace.
     Anything ambiguous attaches nothing rather than guessing.
     """
-    connection = environment.connection
-    metadata = json.loads(connection.auth_metadata) if connection and connection.auth_metadata else {}
+    from services import resource_registry
+
+    # This domain's own registry row only - never another domain's Lakehouse.
+    config = resource_registry.configured(db, environment, resource_registry.registry_domain(domain))
     lakehouses = (
         db.query(Resource)
         .filter(Resource.environment_id == environment.id, Resource.resource_type == "Lakehouse")
         .all()
     )
 
-    configured_id = (metadata.get("cluster_lakehouse_id") or "").strip()
+    configured_id = (config.get("lakehouse_id") or "").strip()
     if configured_id:
         discovered = next((l for l in lakehouses if l.platform_resource_id == configured_id), None)
         name = (
             (discovered.display_name if discovered else "")
-            or metadata.get("cluster_source_lakehouse")
-            or metadata.get("lakehouse_database")
+            or config.get("source_lakehouse")
+            or config.get("lakehouse_database")
             or ""
         )
         return {
             "id": configured_id,
             "name": name,
-            "workspace_id": (metadata.get("cluster_lakehouse_workspace_id") or environment.workspace_id or ""),
+            "workspace_id": (config.get("lakehouse_workspace_id") or environment.workspace_id or ""),
             "source": "configured",
         }
 
     if not lakehouses:
         return None
-    wanted = (
-        metadata.get("cluster_source_lakehouse")
-        or metadata.get("source_lakehouse")
-        or metadata.get("lakehouse_database")
-        or ""
-    ).strip().lower()
+    wanted = (config.get("source_lakehouse") or config.get("lakehouse_database") or "").strip().lower()
 
     match = next((l for l in lakehouses if l.display_name.lower() == wanted), None) if wanted else None
     if match is None and len(lakehouses) == 1:
@@ -524,7 +561,7 @@ def default_lakehouse(db: Session, environment: Environment) -> dict[str, str] |
 ACELO_FABRIC_ENVIRONMENT_NAME = "ACELO_Cluster_Environment"
 
 
-def fabric_environment(db: Session, environment: Environment) -> dict[str, str] | None:
+def fabric_environment(db: Session, environment: Environment, domain: str = "cluster") -> dict[str, str] | None:
     """
     The Fabric Environment (Spark libraries) the Cluster notebook runs with.
 
@@ -532,9 +569,10 @@ def fabric_environment(db: Session, environment: Environment) -> dict[str, str] 
     come from here. Resolved from configuration or discovery — never hardcoded.
     None means the notebook runs on the workspace default environment.
     """
-    connection = environment.connection
-    metadata = json.loads(connection.auth_metadata) if connection and connection.auth_metadata else {}
-    configured = (metadata.get("cluster_fabric_environment_id") or "").strip()
+    from services import resource_registry
+
+    configured = (resource_registry.configured(db, environment, resource_registry.registry_domain(domain))
+                  .get("fabric_environment_id") or "").strip()
 
     environments = (
         db.query(Resource)
@@ -549,7 +587,9 @@ def fabric_environment(db: Session, environment: Environment) -> dict[str, str] 
             "workspace_id": environment.workspace_id or "",
             "source": "configured",
         }
-    match = next((e for e in environments if e.display_name == ACELO_FABRIC_ENVIRONMENT_NAME), None)
+    wanted_name = ACELO_FABRIC_ENVIRONMENT_NAME if resource_registry.registry_domain(domain) == "cluster" else (
+        f"ACELO_{resource_registry.registry_domain(domain).title()}_Environment")
+    match = next((e for e in environments if e.display_name == wanted_name), None)
     if match is None:
         return None
     return {
@@ -793,14 +833,18 @@ def resolved_pipelines(db: Session, environment: Environment) -> dict[str, str]:
 
 def result_location(db: Session, environment: Environment) -> dict[str, str]:
     """
-    Where Cluster results are read from on OneLake: the notebook's default
-    Lakehouse (configured Lakehouse ID or discovery). Empty when unresolved —
-    the adapter then reports exactly what to configure.
+    Where each domain's results are read from on OneLake: THAT domain's default
+    Lakehouse (its configured Lakehouse ID, or discovery). A domain with nothing
+    resolved gets no location - never another domain's.
     """
-    lakehouse = default_lakehouse(db, environment)
-    if not lakehouse or not lakehouse.get("id"):
-        return {}
-    location = {"cluster_result_lakehouse_id": lakehouse["id"]}
-    if lakehouse.get("workspace_id"):
-        location["cluster_result_lakehouse_workspace_id"] = lakehouse["workspace_id"]
+    from services import resource_registry
+
+    location: dict[str, str] = {}
+    for domain in resource_registry.DOMAINS:
+        lakehouse = default_lakehouse(db, environment, domain)
+        if not lakehouse or not lakehouse.get("id"):
+            continue
+        location[f"{domain}_result_lakehouse_id"] = lakehouse["id"]
+        if lakehouse.get("workspace_id"):
+            location[f"{domain}_result_lakehouse_workspace_id"] = lakehouse["workspace_id"]
     return location

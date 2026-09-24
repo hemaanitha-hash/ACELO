@@ -348,9 +348,8 @@ def execute_file_run(job_run_id: str, stored_path: str, display_name: str, focus
         db.commit()
         job_service.append_log(db, run, "INFO", f"Analysed {len(rows)} clusters.", source="file")
         job_service._recompute_analysis_job_status(db, run.analysis_job_id)
-        from services import approval_service
-
-        approval_service.safe_sync(db, run, payload)
+        # Cluster = reporting only: update the current cluster state, no approvals.
+        job_service.route_result(db, run, payload)
     except Exception:  # noqa: BLE001 - a worker failure must never take the app down
         logger.exception("file_analysis event=worker_error run_id=%s", job_run_id)
     finally:

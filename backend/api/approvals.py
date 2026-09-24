@@ -110,10 +110,14 @@ def _refused(exc: approvals.ApprovalError):
 def list_approvals(
     status: str | None = None,
     acelo_run_id: str | None = None,
+    domain: str = "query",
     db: Session = Depends(get_db),
     customer: Customer = Depends(get_current_customer),
 ):
-    query = db.query(OptimizationApproval).filter(OptimizationApproval.customer_id == customer.id)
+    """The Approval Center: QUERY optimizations by default. Clusters need no approval."""
+    query = db.query(OptimizationApproval).filter(
+        OptimizationApproval.customer_id == customer.id, OptimizationApproval.domain == domain
+    )
     if status:
         wanted = [s.strip().upper() for s in status.split(",") if s.strip()]
         unknown = sorted(set(wanted) - set(approvals.STATUSES))
@@ -130,11 +134,12 @@ def list_approvals(
 
 @router.get("/summary")
 def approvals_summary(
+    domain: str = "query",
     db: Session = Depends(get_db),
     customer: Customer = Depends(get_current_customer),
 ):
-    """Counts per status from the real approval records."""
-    return approvals.summary(db, customer.id)
+    """Counts per status from the real approval records (query by default; never mixed)."""
+    return approvals.summary(db, customer.id, domain)
 
 
 @router.post("/refresh")
@@ -166,9 +171,9 @@ async def refresh_from_tracking_table(
     if not outcomes:
         raise HTTPException(
             status_code=409,
-            detail="No approval tracking table is configured. Set it in Settings → Cluster Settings.",
+            detail="No Fabric environment is set up to read query approvals from.",
         )
-    return {"sources": outcomes, "summary": approvals.summary(db, customer.id)}
+    return {"sources": outcomes, "summary": approvals.summary(db, customer.id, "query")}
 
 
 @router.post("/from-run")
@@ -191,6 +196,11 @@ def send_to_approval(
     )
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.domain == "cluster":
+        raise HTTPException(
+            status_code=409,
+            detail="Cluster recommendations are reporting only and do not require approval.",
+        )
     if run.status != "COMPLETED" or not run.result_json:
         raise HTTPException(status_code=409, detail="This run has no retrieved results to review.")
     created = approvals.sync_from_run(db, run, json.loads(run.result_json), payload.resource_id)
@@ -258,6 +268,22 @@ def cancel(
     approval = _get_or_404(db, approval_id, customer)
     try:
         approvals.cancel(db, approval, actor, payload.reason)
+    except approvals.ApprovalError as exc:
+        _refused(exc)
+    return approvals.serialize(approval, _history(db, approval))
+
+
+@router.post("/{approval_id}/reopen")
+def reopen(
+    approval_id: str,
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+    actor: approvals.Actor = Depends(current_actor),
+):
+    """Explicitly starts a new approval cycle for a newer recommendation."""
+    approval = _get_or_404(db, approval_id, customer)
+    try:
+        approvals.reopen(db, approval, actor)
     except approvals.ApprovalError as exc:
         _refused(exc)
     return approvals.serialize(approval, _history(db, approval))

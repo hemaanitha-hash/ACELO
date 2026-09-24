@@ -2,6 +2,8 @@ import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { AlertCircle } from "lucide-react";
 import Layout from "../components/Layout";
+import PageHeader from "../components/PageHeader";
+import { StatePanel } from "../components/StateBlock";
 import { ApiError } from "../services/environmentApi";
 import { display, listApprovals, usd, type Approval } from "../services/approvalsApi";
 
@@ -35,14 +37,12 @@ export default function Execution() {
   return (
     <Layout pageName="Execution" onRefresh={() => void load()}>
       <div className="flex flex-col gap-6">
-        <div>
-          <h1 className="text-display font-semibold text-ink">Execution</h1>
-          <p className="mt-2 text-sm text-ink-muted">
-            Approved optimizations and their real platform executions.
-          </p>
-        </div>
+        <PageHeader
+          title="Execution"
+          description="Approved optimizations and their real platform executions."
+        />
 
-        {loading && <div className="surface py-16 text-center text-sm text-ink-muted">Loading executions...</div>}
+        {loading && <StatePanel kind="loading" title="Loading executions…" />}
 
         {!loading && error && (
           <div className="surface border-l-4 border-l-signal-high p-5">

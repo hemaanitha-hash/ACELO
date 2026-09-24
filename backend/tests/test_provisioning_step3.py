@@ -576,14 +576,15 @@ def test_overview_shows_honest_empty_state_without_real_runs(client, customer):
 
     assert body["hasData"] is False
     assert body["completedRuns"] == 0
-    assert body["kpis"]["monthlyCost"] == 0
-    assert body["kpis"]["potentialSavings"] == 0
+    # Unknown is null ("Not available" in the UI), never a fabricated 0.
+    assert body["kpis"]["monthlyCost"] is None
+    assert body["kpis"]["potentialSavings"] is None
     assert body["kpis"]["openOpportunities"] == 0
     # No invented health score.
     assert body["kpis"]["optimizationHealth"] is None
     for block in body["health"]:
         assert block["health"] is None
-        assert block["potentialSavings"] == 0
+        assert block["potentialSavings"] is None
 
 
 def test_no_endpoint_seeds_fabricated_data(client, db_session, customer):
@@ -597,7 +598,7 @@ def test_no_endpoint_seeds_fabricated_data(client, db_session, customer):
 
 
 def test_seeding_functions_are_never_invoked_by_the_app():
-    """optimization_engine is retained but must be unreachable from the app."""
+    """The demo seeder was removed; no seeding call may reappear in the app."""
     import pathlib
 
     backend = pathlib.Path(__file__).resolve().parent.parent
@@ -725,17 +726,14 @@ async def test_missing_query_and_storage_are_not_reported_ready(
 
 
 def _configure_cluster_tables(db_session, env):
-    connection = db_session.query(Connection).filter(Connection.id == env.connection_id).first()
-    metadata = json.loads(connection.auth_metadata) if connection.auth_metadata else {}
-    metadata.update(
-        {
-            "cluster_source_table": "realistic_cluster_dataset",
-            "cluster_result_table": "acelo_cluster_recommendations",
-            "lakehouse_database": "Data",
-        }
-    )
-    connection.auth_metadata = json.dumps(metadata)
-    db_session.commit()
+    """Cluster configuration lives in the Environment Resource Registry (domain=cluster)."""
+    from services import resource_registry
+
+    resource_registry.update(db_session, env, "cluster", {
+        "source_table": "realistic_cluster_dataset",
+        "result_table": "acelo_cluster_recommendations",
+        "lakehouse_database": "Data",
+    })
 
 
 @pytest.mark.asyncio

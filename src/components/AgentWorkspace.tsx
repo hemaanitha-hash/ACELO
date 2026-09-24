@@ -1,10 +1,25 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { AlertCircle, ArrowUp, FileText, Paperclip, Sparkles, X } from "lucide-react";
+import { AlertCircle, ArrowUp, Database, FileText, Paperclip, Sparkles, X } from "lucide-react";
 import { suggestedPrompts } from "../data/prompts";
 import { detectApprovalIntent } from "../services/approvalsApi";
 import type { AgentStep } from "../types";
 import AgentTimeline from "./AgentTimeline";
+import DatabricksAgentResult from "./DatabricksAgentResult";
+import {
+  getActiveContext,
+  PLATFORM_LABELS,
+  subscribe,
+  type ActiveContext,
+} from "../services/platformContext";
+import { isDatabricksOnly } from "../services/experience";
+import {
+  AgentApiError,
+  analyzeDatabricksCompute,
+  isDatabricksComputeRequest,
+  type AgentAnalysisResult,
+} from "../services/databricksAgentApi";
+import { setComputeAnalysis } from "../services/computeAnalysis";
 import Button from "./Button";
 import { useMsal } from "@azure/msal-react";
 import { ApiError } from "../services/environmentApi";
@@ -71,6 +86,44 @@ const FILE_PROMPTS = [
   "Find oversized clusters",
 ];
 
+/**
+ * States plainly which platform and connection the agent is operating against.
+ * Read from the same global context the rest of the app uses, so it can never
+ * disagree with the sidebar or the breadcrumb.
+ */
+function AgentTarget() {
+  const [context, setContext] = useState<ActiveContext>(getActiveContext());
+  useEffect(() => subscribe(setContext), []);
+
+  if (!context.platform) {
+    return (
+      <p className="mt-5 flex items-center gap-2 rounded-sm border border-panel-border bg-canvas-raised px-3 py-2 text-sm text-ink-muted">
+        <AlertCircle size={14} className="shrink-0 text-signal-medium" />
+        {isDatabricksOnly()
+          ? "ACELO is still resolving the Databricks workspace. Refresh if this persists."
+          : "No platform connected. Set one up in Environment Setup first."}
+      </p>
+    );
+  }
+
+  return (
+    <p
+      data-testid="agent-target"
+      className="mt-5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-sm border border-panel-border bg-canvas-raised px-3 py-2 text-sm"
+    >
+      <Database size={14} className="shrink-0 text-ink-muted" />
+      <span className="text-ink-muted">Analyzing</span>
+      <span className="font-medium text-ink">{PLATFORM_LABELS[context.platform]}</span>
+      {context.connection && (
+        <>
+          <span className="text-ink-faint">·</span>
+          <span className="truncate text-ink-muted">{context.connection.name}</span>
+        </>
+      )}
+    </p>
+  );
+}
+
 interface AgentWorkspaceProps {
   initialPrompt?: string;
 }
@@ -81,6 +134,8 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
   const [prompt, setPrompt] = useState(initialPrompt ?? "");
   const [runState, setRunState] = useState<RunState>("idle");
   const [job, setJob] = useState<AnalysisJob | null>(null);
+  // The Databricks compute analysis answers in-request, so it has no job to poll.
+  const [databricksResult, setDatabricksResult] = useState<AgentAnalysisResult | null>(null);
   const [results, setResults] = useState<JobResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<UploadValidationError | null>(null);
@@ -187,7 +242,29 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
     setUploadError(null);
     setResults([]);
     setJob(null);
+    setDatabricksResult(null);
     setRunState("starting");
+
+    // A request to analyse REAL Databricks compute is answered in the request
+    // itself: discover -> analyse -> recommend, with no platform job and no
+    // background worker. Only a prompt that names Databricks takes this path,
+    // so every existing prompt keeps its current behaviour.
+    if (!file && isDatabricksComputeRequest(trimmed)) {
+      try {
+        const analysis = await analyzeDatabricksCompute(trimmed);
+        setDatabricksResult(analysis);
+        // The agent is also a producer of the journey's analysis, so a user who
+        // asks here and then opens Recommendations sees the same findings.
+        setComputeAnalysis(analysis);
+        setRunState("done");
+      } catch (e: unknown) {
+        setRunState("error");
+        setError(
+          e instanceof AgentApiError ? e.message : "The Databricks analysis could not be completed."
+        );
+      }
+      return;
+    }
 
     try {
       // A request with an uploaded file always takes the file-analysis path:
@@ -324,15 +401,21 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-sm bg-brand-500/15 border border-brand-500/25">
               <Sparkles size={16} className="text-brand-300" />
             </span>
-            <div>
-              <h2 className="text-base font-semibold text-ink">Your optimization copilot</h2>
+            <div className="min-w-0">
+              <h2 className="text-base font-semibold text-ink">
+                How can I help optimize your Databricks environment?
+              </h2>
               <p className="mt-1 text-sm text-ink-muted max-w-xl">
-                Describe what you want to analyze. ACELO understands the intent
-                and runs the matching optimization notebook in your connected
-                workspace.
+                Describe what you want to analyze. Databricks is already the active platform,
+                so you never need to name it or pick a workspace.
               </p>
             </div>
           </div>
+
+          {/* Which platform the agent will act on. The agent previously gave no
+              indication at all, so an answer about clusters could have come from
+              either platform with nothing on screen to say which. */}
+          <AgentTarget />
 
           <form
             onSubmit={(e) => {
@@ -463,10 +546,23 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
             </div>
           )}
 
+          {/* Databricks compute analysis: answered in-request, so it carries its
+              own real step list and result instead of a polled job. */}
+          {(databricksResult || (runState === "starting" && isDatabricksComputeRequest(prompt))) && (
+            <div className="mt-6">
+              <p className="label-eyebrow mb-4">Agent activity</p>
+              <DatabricksAgentResult
+                result={databricksResult}
+                running={runState === "starting"}
+              />
+            </div>
+          )}
+
+          {!databricksResult && (
           <div className="mt-6 grid gap-8 lg:grid-cols-[1fr_260px]">
             <div>
               <p className="label-eyebrow mb-4">Agent activity</p>
-              {runState === "starting" && (
+              {runState === "starting" && !isDatabricksComputeRequest(prompt) && (
                 <p className="text-sm text-ink-muted">
                   {file
                     ? "Uploading and validating the file..."
@@ -497,7 +593,7 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
                         {/* Only ever the id the platform returned; never generated here. */}
                         {run.platform_run_id && (
                           <p className="mt-1 break-all text-[11px] text-ink-faint">
-                            {job.platform === "fabric" ? "Fabric Run ID" : "Platform run"}:{" "}
+                            {"Platform run ID"}:{" "}
                             <span data-testid="platform-run-id" className="font-mono">
                               {run.platform_run_id}
                             </span>
@@ -555,6 +651,7 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
               </div>
             )}
           </div>
+          )}
         </div>
       )}
     </div>

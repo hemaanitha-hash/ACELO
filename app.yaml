@@ -1,0 +1,19 @@
+command:
+  - uvicorn
+  - main:app
+  - --app-dir
+  - backend
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8000"
+
+env:
+  - name: APP_ENV
+    value: production
+
+  - name: DATABASE_URL
+    value: "sqlite:////tmp/acelo.db"
+
+  - name: ACELO_DATABRICKS_SERVERLESS_IDS
+    value: ""

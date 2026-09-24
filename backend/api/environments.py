@@ -15,7 +15,7 @@ import re
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
-from api.deps import get_current_customer
+from api.deps import get_current_customer, require_resource_admin, resource_access
 from database import get_db
 from models import Connection, Customer, Environment, Resource
 from schemas.environment import (
@@ -27,6 +27,7 @@ from schemas.environment import (
     ProvisioningOut,
     ReadinessOut,
 )
+from services import resource_registry
 from services import environment_service, job_service, package_registry, provisioning_service
 
 router = APIRouter(prefix="/api/environments", tags=["environments"])
@@ -197,13 +198,23 @@ def _metadata(connection: Connection | None) -> dict:
     return json.loads(connection.auth_metadata)
 
 
-def _read_cluster_settings(connection: Connection | None) -> dict[str, str | None]:
-    """Stored values; anything not configured is None (never "", 0 or a sample)."""
+# Settings stored in the registry row; the rest stay connection-level (legacy SQL path).
+_CONNECTION_LEVEL = {"sql_endpoint"}
+
+
+def _read_cluster_settings(db: Session, environment: Environment) -> dict[str, str | None]:
+    """The administrator's Cluster mapping; unset is None (never "", 0 or a sample).
+    Values that come from backend configuration are not copied into the form."""
+    config = resource_registry.stored(db, environment, "cluster")
+    connection = db.query(Connection).filter(Connection.id == environment.connection_id).first()
     metadata = _metadata(connection)
-    return {
-        field: (str(metadata[key]) if metadata.get(key) else None)
-        for field, (key, _) in _CLUSTER_SETTINGS.items()
-    }
+    out: dict[str, str | None] = {}
+    for field, (key, _) in _CLUSTER_SETTINGS.items():
+        if field in _CONNECTION_LEVEL:
+            out[field] = str(metadata[key]) if metadata.get(key) else None
+        else:
+            out[field] = config.get(field) or None
+    return out
 
 
 def _workspace_pipelines(db: Session, environment: Environment) -> list[dict]:
@@ -230,13 +241,12 @@ def cluster_execution(db: Session, environment: Environment) -> dict:
     The execution path a Cluster run will ACTUALLY take — the same resolution
     the adapter uses: a configured pipeline wins, else the ACELO-deployed one.
     """
-    connection = db.query(Connection).filter(Connection.id == environment.connection_id).first()
-    metadata = _metadata(connection)
-    execution_type = "pipeline" if metadata.get("cluster_execution_type") == "pipeline" else "notebook"
+    config = resource_registry.configured(db, environment, "cluster")
+    execution_type = "pipeline" if config.get("execution_type") == "pipeline" else "notebook"
     pipelines = {p["id"]: p for p in _workspace_pipelines(db, environment)}
 
     pipeline = None
-    configured = metadata.get("cluster_pipeline_id")
+    configured = config.get("pipeline_id")
     if configured:
         known = pipelines.get(configured)
         pipeline = {"id": configured, "name": known["name"] if known else None, "source": "configured"}
@@ -266,9 +276,8 @@ def get_cluster_settings(
 ):
     """The Cluster settings as persisted, plus the execution path they resolve to."""
     environment = _get_or_404(db, environment_id, customer)
-    connection = db.query(Connection).filter(Connection.id == environment.connection_id).first()
     return {
-        "settings": _read_cluster_settings(connection),
+        "settings": _read_cluster_settings(db, environment),
         "missing": _cluster_missing(db, environment),
         "execution": cluster_execution(db, environment),
         "pipelines": _workspace_pipelines(db, environment),
@@ -281,6 +290,7 @@ def put_cluster_settings(
     payload: dict[str, str | None],
     db: Session = Depends(get_db),
     customer: Customer = Depends(get_current_customer),
+    _admin: dict = Depends(require_resource_admin),
 ):
     """
     Persists Cluster settings. Fields omitted are unchanged; an empty value
@@ -295,11 +305,30 @@ def put_cluster_settings(
         raise HTTPException(status_code=422, detail=f"Unknown Cluster settings: {', '.join(unknown)}.")
 
     metadata = _metadata(connection)
+    changes = _validated_changes(db, environment, payload, _CLUSTER_SETTINGS)
+    for field, value in changes.items():
+        if field in _CONNECTION_LEVEL:
+            key = _CLUSTER_SETTINGS[field][0]
+            if value:
+                metadata[key] = value
+            else:
+                metadata.pop(key, None)
+    connection.auth_metadata = json.dumps(metadata)
+    # Everything else is Cluster configuration in the Environment Resource Registry.
+    resource_registry.update(db, environment, "cluster",
+                             {k: v for k, v in changes.items() if k not in _CONNECTION_LEVEL})
+    db.commit()
+    return get_cluster_settings(environment_id, db, customer)
+
+
+def _validated_changes(db: Session, environment: Environment, payload: dict, fields: dict) -> dict[str, str | None]:
+    """Validates identifiers; refuses placeholders. Empty value = clear."""
+    changes: dict[str, str | None] = {}
     for field, raw in payload.items():
-        key, pattern = _CLUSTER_SETTINGS[field]
+        key, pattern = fields[field]
         value = (raw or "").strip()
         if not value:
-            metadata.pop(key, None)
+            changes[field] = None
             continue
         if _is_placeholder(value):
             raise HTTPException(
@@ -327,11 +356,65 @@ def put_cluster_settings(
                 detail="That pipeline was not found in this workspace. Run Discover Environment, "
                 "then choose a pipeline from the list.",
             )
-        metadata[key] = value
+        changes[field] = value
+    return changes
 
-    connection.auth_metadata = json.dumps(metadata)
-    db.commit()
-    return get_cluster_settings(environment_id, db, customer)
+
+# Per-domain resource mapping (Environment Setup > Optimization Resources > Advanced).
+_DOMAIN_SETTINGS = {
+    "execution_type": ("execution_type", _EXECUTION_TYPE),
+    "pipeline_id": ("pipeline_id", _ITEM_ID),
+    "notebook_id": ("notebook_id", _ITEM_ID),
+    "lakehouse_id": ("lakehouse_id", _ITEM_ID),
+    "lakehouse_workspace_id": ("lakehouse_workspace_id", _ITEM_ID),
+    "source_lakehouse": ("source_lakehouse", _TABLE_NAME),
+    "result_lakehouse": ("result_lakehouse", _TABLE_NAME),
+    "source_schema": ("source_schema", _SCHEMA_NAME),
+    "result_schema": ("result_schema", _SCHEMA_NAME),
+    "source_table": ("source_table", _TABLE_NAME),
+    "result_table": ("result_table", _TABLE_NAME),
+    "approval_tracking_table": ("approval_tracking_table", _TABLE_NAME),
+    "column_mapping": ("column_mapping", None),
+    "fabric_environment_id": ("fabric_environment_id", _ITEM_ID),
+    "llm_key_vault_uri": ("llm_key_vault_uri", re.compile(r"^https://[A-Za-z0-9.\-]+/?$")),
+    "llm_secret_name": ("llm_secret_name", re.compile(r"^[A-Za-z0-9\-]{1,127}$")),
+    "llm_model_name": ("llm_model_name", _TABLE_NAME),
+    "validation_batch_size": ("validation_batch_size", re.compile(r"^[1-9][0-9]{0,2}$")),
+}
+
+
+@router.get("/{environment_id}/optimization-resources")
+def get_optimization_resources(
+    environment_id: str,
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+    access: dict = Depends(resource_access),
+):
+    """Per-domain status and mapping (identifiers only, never credentials)."""
+    environment = _get_or_404(db, environment_id, customer)
+    return {"domains": resource_registry.summary(db, environment), "pipelines": _workspace_pipelines(db, environment),
+            "access": access}
+
+
+@router.put("/{environment_id}/optimization-resources/{domain}")
+def put_optimization_resources(
+    environment_id: str,
+    domain: str,
+    payload: dict[str, str | None],
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+    _admin: dict = Depends(require_resource_admin),
+):
+    """Administrator resource mapping for ONE domain. Other domains are untouched."""
+    environment = _get_or_404(db, environment_id, customer)
+    if domain not in resource_registry.DOMAINS:
+        raise HTTPException(status_code=404, detail=f"Unknown optimization domain: {domain}")
+    unknown = sorted(set(payload) - set(_DOMAIN_SETTINGS))
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown {domain} resource settings: {', '.join(unknown)}.")
+    changes = _validated_changes(db, environment, payload, _DOMAIN_SETTINGS)
+    resource_registry.update(db, environment, domain, changes)
+    return get_optimization_resources(environment_id, db, customer, _admin)
 
 
 @router.delete("/{environment_id}")
@@ -405,22 +488,13 @@ def list_resources(
 
 def _domain_parameters(db: Session, environment, domain: str) -> dict[str, str]:
     """
-    The per-domain notebook settings currently stored on this environment's
-    connection, resolved the same way execution resolves them (a
-    `{domain}_` prefixed key wins over the shared one).
+    The notebook settings this domain's runs receive - from its own row in the
+    Environment Resource Registry, exactly as execution builds them.
     """
-    connection = (
-        db.query(Connection).filter(Connection.id == environment.connection_id).first()
-    )
-    if connection is None or not connection.auth_metadata:
-        return {}
-    metadata = json.loads(connection.auth_metadata)
-    return {
-        key: str(value)
-        for key in job_service._PARAMETER_KEYS
-        for value in (metadata.get(f"{domain}_{key}", metadata.get(key)),)
-        if value
-    }
+    params = resource_registry.build_runtime_parameters(db, environment, domain, "-")
+    params.pop("acelo_run_id", None)
+    params.pop("environment_id", None)
+    return params
 
 
 @router.get("/{environment_id}/readiness", response_model=ReadinessOut)

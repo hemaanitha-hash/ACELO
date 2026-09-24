@@ -10,9 +10,8 @@
 // ============================================================================
 
 import { ApiError, fabricTokenHeader } from "./environmentApi";
-
-const API_BASE =
-  (import.meta.env?.VITE_API_BASE as string | undefined) ?? "http://localhost:8000/api";
+import { getActiveContext, platformHeaders } from "./platformContext";
+import { API_BASE } from "./apiBase";
 
 /** Mirrors backend models/enums.py JobStatus. */
 export type RunStatus =
@@ -59,9 +58,9 @@ export const ERROR_MESSAGES: Record<string, string> = {
   CANCELED: "This run was canceled.",
   UNSUPPORTED: "This operation is not supported for this environment.",
   CLUSTER_SOURCE_TABLE_NOT_CONFIGURED:
-    "The Cluster source table is not configured for this environment. Set it in Environment Setup.",
+    "Cluster optimization is not fully set up in this environment (source table). An administrator can map it in Environment Setup > Optimization Resources.",
   CLUSTER_RESULT_TABLE_NOT_CONFIGURED:
-    "The Cluster result table is not configured for this environment. Set it in Environment Setup.",
+    "Cluster optimization is not fully set up in this environment (result table). An administrator can map it in Environment Setup > Optimization Resources.",
   NOTEBOOK_NOT_CONFIGURED:
     "The optimization notebook for this domain is not registered in this environment. Run 'Set up ACELO in Fabric' in Environment Setup.",
 };
@@ -147,7 +146,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   try {
     res = await fetch(`${API_BASE}${path}`, {
       ...options,
-      headers: { "Content-Type": "application/json", ...options?.headers },
+      headers: { "Content-Type": "application/json", ...platformHeaders(), ...options?.headers },
     });
   } catch {
     throw new ApiError("Could not reach the ACELO backend. Check that the API is running.", 0);
@@ -206,7 +205,22 @@ export async function resolveExecutionTarget(): Promise<ExecutionTarget> {
     );
   }
 
-  const chosen = backed.find((c) => c.status === "connected") ?? backed[0];
+  // The ACTIVE platform decides. Previously this picked the first connected
+  // connection, so with both a Fabric and a Databricks connection configured
+  // an analysis could run against whichever happened to sort first — the
+  // cross-platform leak this context exists to close.
+  const active = getActiveContext();
+  const inPlatform = active.platform ? backed.filter((c) => c.platform === active.platform) : backed;
+  if (active.platform && inPlatform.length === 0) {
+    throw new ApiError(
+      `No ${active.platform} environment is set up yet. Complete Environment Setup for this platform first.`,
+      0
+    );
+  }
+  const chosen =
+    inPlatform.find((c) => c.id === active.connection?.id) ??
+    inPlatform.find((c) => c.status === "connected") ??
+    inPlatform[0];
   const environment = environments.find((e) => e.connection_id === chosen.id);
   const mode = environment?.auth_mode ?? "";
   return { connectionId: chosen.id, delegated: mode === "user" || mode === "personal" };
