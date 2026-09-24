@@ -1,0 +1,17 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.3
+pydantic-settings==2.9.1
+httpx==0.28.1
+databricks-sdk==0.139.0
+msal
+pyodbc
+sqlalchemy
+pandas
+numpy
+xgboost
+python-multipart
+scikit-learn
+deltalake
+pyarrow
+SQLAlchemy>=2.0,<3.0
