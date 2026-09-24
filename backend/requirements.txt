@@ -14,3 +14,4 @@ python-multipart
 scikit-learn
 deltalake
 pyarrow
+SQLAlchemy>=2.0,<3.0
