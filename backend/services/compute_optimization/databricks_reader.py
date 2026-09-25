@@ -35,6 +35,7 @@ class DatabricksSQLReader:
         ).strip()
 
         self.timeout = timeout
+        self.access_token = access_token
 
         self.endpoint = (
             databricks_auth.app_host()
@@ -42,6 +43,11 @@ class DatabricksSQLReader:
         ).rstrip("/")
 
     def _headers(self) -> dict[str, str]:
+        if self.access_token:
+            return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        }
         headers = databricks_auth.app_auth_headers()
 
         if not headers:
