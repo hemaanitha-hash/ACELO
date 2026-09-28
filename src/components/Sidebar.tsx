@@ -71,6 +71,7 @@ const mvpNavItems: NavItem[] = [
   { to: "/agent", label: "AI Agent", icon: Sparkles },
   { to: "/compute", label: "Compute Optimization", icon: Database },
   { to: "/recommendations", label: "Recommendations", icon: FileText },
+  { to: "/approvals", label: "Approvals", icon: ShieldCheck },
 ];
 
 const platformNavItems: Record<ActivePlatformId, NavItem[]> = {
@@ -94,15 +95,22 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
 
   // The switcher lists the customer's REAL connections, not a hardcoded array.
   useEffect(() => {
+    if (databricksOnly && getActiveContext().platform !== "databricks") {
+      // A remembered Fabric context must not survive into the Stage 1 MVP.
+      setActiveContext(null);
+    }
     let cancelled = false;
     void (async () => {
       try {
         const loaded = await listPlatformConnections();
         if (cancelled) return;
         setConnections(loaded);
-        // Adopt a selection only if nothing is active yet, so switching is
-        // never undone by a later refresh.
-        if (!getActiveContext().connection) setActiveContext(resolveInitial(loaded));
+        if (databricksOnly) {
+          setActiveContext(resolveInitial(loaded, "databricks"));
+        } else if (!getActiveContext().connection) {
+          // Legacy mode preserves its remembered/connected/first selection.
+          setActiveContext(resolveInitial(loaded));
+        }
       } catch {
         /* the switcher stays empty; pages surface their own errors */
       }

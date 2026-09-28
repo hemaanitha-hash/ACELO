@@ -36,6 +36,12 @@ export default defineConfig({
     // 5173, producing exactly the same ERR_CONNECTION_REFUSED in the popup while
     // the main tab carried on working.
     strictPort: true,
+    proxy: {
+    "/api": {
+      target: "http://localhost:8000",
+      changeOrigin: true,
+    },
+  },
   },
   preview: {
     host: "::",
