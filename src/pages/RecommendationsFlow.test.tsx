@@ -9,7 +9,7 @@ import {
   resetComputeAnalysis,
   setComputeAnalysis,
 } from "../services/computeAnalysis";
-import type { AgentAnalysisResult } from "../services/databricksAgentApi";
+import type { AgentAnalysisResult, Stage1Recommendation } from "../services/databricksAgentApi";
 
 /**
  * Recommendations consumes the SAME Databricks analysis the rest of the journey
@@ -57,6 +57,41 @@ const ANALYSIS_RESULT: AgentAnalysisResult = {
   markdown: "## Observed Facts",
 };
 
+const STAGE1_RECOMMENDATION: Stage1Recommendation = {
+  recommendation_id: "stage1-rec-1",
+  domain: "CLUSTER_SIZING",
+  resource_type: "CLASSIC_CLUSTER",
+  resource_id: "cluster-1",
+  resource_name: "analytics",
+  finding_id: "finding-1",
+  rule_id: "STAGE1.CLUSTER_SIZING.OVERSIZED",
+  finding_type: "OVERSIZED",
+  title: "Review cluster capacity",
+  summary: "Observed low utilization on this cluster.",
+  description: "The deterministic rule found sustained low utilization.",
+  evidence: { avg_cpu_percent: 12.5, avg_memory_percent: 20 },
+  evidence_references: [{ resource_id: "cluster-1" }],
+  current_state: { worker_count: 8 },
+  proposed_state: { direction: "review_worker_capacity", reason: "Capacity may exceed demand." },
+  expected_impact: { status: "POTENTIAL", description: "Potential reduction in excess worker capacity." },
+  estimated_savings: { status: "NOT_AVAILABLE", estimated: null, measured: null },
+  confidence: "low",
+  severity: "MEDIUM",
+  risk: "MEDIUM",
+  policy_status: "NOT_EVALUATED",
+  approval_status: "NOT_REQUESTED",
+  execution_status: "NOT_STARTED",
+  verification_status: "NOT_STARTED",
+  status: "OPEN",
+  customer_id: "customer-1",
+  environment_id: "env-1",
+  workspace_name: "workspace-1",
+  observation_window: { start: "2026-09-01T00:00:00Z", end: "2026-09-01T02:00:00Z" },
+  evidence_quality: { completeness: "COMPLETE", freshness: "UNKNOWN" },
+  created_at: "2026-09-01T02:01:00Z",
+  updated_at: "2026-09-01T02:01:00Z",
+};
+
 function mockAnalyze(body: unknown, ok = true, status = 200) {
   const fetchMock = vi.fn().mockResolvedValue({
     ok,
@@ -87,6 +122,31 @@ afterEach(() => {
 });
 
 describe("Recommendations consumes the Databricks analysis", () => {
+  it("renders deterministic Stage 1 recommendations with evidence and no action controls", async () => {
+    const result: AgentAnalysisResult = {
+      ...ANALYSIS_RESULT,
+      analysis: {
+        ...ANALYSIS_RESULT.analysis!,
+        compute_optimization: {
+          findings: [],
+          recommendations: [STAGE1_RECOMMENDATION],
+          summary: {},
+        },
+      },
+    };
+    mockAnalyze(result);
+    setComputeAnalysis(result);
+
+    renderPage(<Recommendations />);
+
+    expect(await screen.findByText("Stage 1 Recommendations")).toBeInTheDocument();
+    expect(screen.getByText("STAGE1.CLUSTER_SIZING.OVERSIZED")).toBeInTheDocument();
+    expect(screen.getByText(/review_worker_capacity/)).toBeInTheDocument();
+    expect(screen.getByText(/Potential reduction in excess worker capacity/)).toBeInTheDocument();
+    expect(screen.getByText(/Not available. No savings estimate or measurement/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /approve|execute/i })).not.toBeInTheDocument();
+  });
+
   it("renders the findings the journey already produced, without re-running", async () => {
     const fetchMock = mockAnalyze(ANALYSIS_RESULT);
     // The journey produced this on Compute Optimization / the AI Agent.

@@ -14,8 +14,9 @@ from sqlalchemy.orm import Session
 
 from api.deps import get_current_customer
 from database import get_db
-from models import ClusterRecommendation, Customer, OptimizationApproval
+from models import ClusterRecommendation, Customer, OptimizationApproval, Recommendation
 from services import approval_service, cluster_state
+from services.compute_optimization.recommendations import serialize_recommendation
 
 router = APIRouter(prefix="/api/optimizations", tags=["optimizations"])
 
@@ -73,6 +74,35 @@ def _query_view(a: OptimizationApproval) -> dict:
     }
 
 
+def _stage1_view(record: Recommendation) -> dict:
+    item = serialize_recommendation(record)
+    return {
+        "id": item["recommendation_id"],
+        "recommendation_id": item["recommendation_id"],
+        "kind": "stage1",
+        "resource": item["resource_name"],
+        "resource_id": item["resource_id"],
+        "domain": "cluster",
+        "stage1_domain": item["domain"],
+        "environment_id": item["environment_id"],
+        "title": item["title"],
+        "description": item["summary"],
+        "estimated_savings_monthly": None,
+        "current_cost_monthly": None,
+        "optimization_label": item["finding_type"],
+        "status": "open",
+        "requires_approval": False,
+        "finding_id": item["finding_id"],
+        "rule_id": item["rule_id"],
+        "severity": item["severity"],
+        "confidence": item["confidence"],
+        "risk": item["risk"],
+        "created_at": item["created_at"],
+        "updated_at": item["updated_at"],
+        "details": item,
+    }
+
+
 @router.get("")
 def list_optimizations(
     domain: str | None = None,
@@ -84,6 +114,11 @@ def list_optimizations(
         items += [_cluster_view(r) for r in
                   db.query(ClusterRecommendation).filter(ClusterRecommendation.customer_id == customer.id)
                   if r.optimization_label in ("Risky", "Moderately Optimized")]
+    if domain in (None, "cluster", "stage1"):
+        items += [_stage1_view(record) for record in db.query(Recommendation).filter(
+            Recommendation.customer_id == customer.id,
+            Recommendation.recommendation_id.is_not(None),
+        )]
     if domain in (None, "query"):
         items += [_query_view(a) for a in db.query(OptimizationApproval).filter(
             OptimizationApproval.customer_id == customer.id, OptimizationApproval.domain == "query")]
@@ -97,6 +132,14 @@ def get_recommendation(
     db: Session = Depends(get_db),
     customer: Customer = Depends(get_current_customer),
 ):
+    if recommendation_id.startswith("stage1-"):
+        record = db.query(Recommendation).filter(
+            Recommendation.recommendation_id == recommendation_id,
+            Recommendation.customer_id == customer.id,
+        ).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Recommendation not found")
+        return _stage1_view(record)
     if recommendation_id.startswith("cluster:"):
         record = (
             db.query(ClusterRecommendation)

@@ -14,11 +14,10 @@ system.billing.
 """
 
 import logging
-
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException,Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-
+from fastapi import Request
 from api.deps import get_current_customer
 from api.platform_context import ActivePlatform, require_databricks
 from database import get_db
@@ -134,6 +133,7 @@ def _resolve_environment(
 
 @router.get("/resources", response_model=DatabricksResourcesOut)
 async def list_databricks_resources(
+    request: Request,
     environment_id: str | None = None,
     db: Session = Depends(get_db),
     customer: Customer = Depends(get_current_customer),
@@ -148,7 +148,9 @@ async def list_databricks_resources(
     types that succeeded.
     """
     environment = _resolve_environment(db, customer, environment_id, context)
-    adapter = environment_service.build_adapter(db, environment)
+    access_token = request.headers.get("X-Forwarded-Access-Token")
+
+    adapter = environment_service.build_adapter(db, environment, delegated_token=access_token)
 
     discovery = await adapter.discover_compute_resources()
     payload = discovery.to_dict()
@@ -205,9 +207,11 @@ class AgentAnalysisOut(BaseModel):
 @router.post("/agent/analyze", response_model=AgentAnalysisOut)
 async def analyze_databricks_compute_endpoint(
     payload: AgentAnalysisRequest,
+    request: Request,
     db: Session = Depends(get_db),
     customer: Customer = Depends(get_current_customer),
-    context: ActivePlatform = Depends(require_databricks),
+    context: ActivePlatform = Depends(require_databricks)
+   
 ):
     """
     The ACELO Optimization Agent's Databricks compute analysis.
@@ -225,12 +229,12 @@ async def analyze_databricks_compute_endpoint(
     from optimizers.cluster_optimizer import groq_llm_from_env
 
     environment = _resolve_environment(db, customer, payload.environment_id, context)
-
+    user_access_token = request.headers.get("X-Forwarded-Access-Token")
     # The same optional LLM the cluster optimizer uses. Absent key -> None, and
     # the analysis falls back to its deterministic summary rather than inventing
     # one. The prompt it receives carries discovered configuration only; no
     # credential is ever placed in it.
-    result = await analyze_databricks_compute(db, environment, llm=groq_llm_from_env())
+    result = await analyze_databricks_compute(db, environment, llm=groq_llm_from_env(),access_token=user_access_token)
 
     logger.info(
         "agent_databricks_analyze env_id=%s customer_id=%s status=%s",

@@ -16,4 +16,4 @@ env:
     value: "sqlite:////tmp/acelo.db"
 
   - name: ACELO_DATABRICKS_SERVERLESS_IDS
-    value: ""
+    value: "83e7e0259f5b1f02?o=7405617514546966"

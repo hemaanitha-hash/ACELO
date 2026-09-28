@@ -26,6 +26,14 @@ export interface Opportunity {
   recommendedAction: string;
   risk: "Low" | "Medium" | "High";
   rollbackAvailable: boolean;
+  stage1Recommendation?: boolean;
+  findingId?: string;
+  ruleId?: string;
+  currentState?: Record<string, unknown>;
+  proposedState?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  evidenceQuality?: Record<string, unknown>;
+  confidence?: "low" | "medium" | "high";
 }
 
 export interface DomainHealth {

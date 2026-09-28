@@ -76,41 +76,75 @@ export default function RecommendationDetail() {
                 {opportunity.recommendedAction}
               </RecommendationCard>
 
-              <div className="flex flex-wrap gap-3">
-                <Button variant="secondary" onClick={() => setReviewOpen(true)}>
-                  Review Proposed Change
-                </Button>
-                {/* Approvals are created from real run results, not from here. */}
-                <Button onClick={() => navigate("/approvals")}>Go to Approvals</Button>
-              </div>
+              {opportunity.stage1Recommendation && (
+                <>
+                  <RecommendationCard eyebrow="Deterministic finding" title="Finding and rule">
+                    {`${opportunity.findingId ?? "Finding ID unavailable"} · ${opportunity.ruleId ?? "Rule ID unavailable"}`}
+                  </RecommendationCard>
+                  <RecommendationCard eyebrow="Observed evidence" title="Current state">
+                    {JSON.stringify(opportunity.currentState ?? {})}
+                  </RecommendationCard>
+                  <RecommendationCard eyebrow="Evidence quality" title="Quality contract">
+                    {JSON.stringify(opportunity.evidenceQuality ?? {})}
+                  </RecommendationCard>
+                  <RecommendationCard eyebrow="Directional only" title="Proposed state">
+                    {JSON.stringify(opportunity.proposedState ?? {})}
+                  </RecommendationCard>
+                </>
+              )}
+
+              {!opportunity.stage1Recommendation && (
+                <div className="flex flex-wrap gap-3">
+                  <Button variant="secondary" onClick={() => setReviewOpen(true)}>
+                    Review Proposed Change
+                  </Button>
+                  {/* Approvals are created from real run results, not from here. */}
+                  <Button onClick={() => navigate("/approvals")}>Go to Approvals</Button>
+                </div>
+              )}
             </div>
 
-            <ImpactCard
-              savingsMonthly={opportunity.impactMonthly}
-              risk={opportunity.risk}
-              rollbackAvailable={opportunity.rollbackAvailable}
-            />
+            {opportunity.stage1Recommendation ? (
+              <section className="surface h-fit p-5">
+                <p className="label-eyebrow">Recommendation status</p>
+                <p className="mt-2 text-sm font-medium text-ink">Open · Reporting only</p>
+                <dl className="mt-4 flex flex-col gap-3 border-t border-panel-border pt-4 text-xs">
+                  <div><dt className="text-ink-faint">Confidence</dt><dd className="mt-1 text-ink-muted">{opportunity.confidence ?? "Not available"}</dd></div>
+                  <div><dt className="text-ink-faint">Severity</dt><dd className="mt-1 text-ink-muted">{opportunity.severity}</dd></div>
+                  <div><dt className="text-ink-faint">Risk</dt><dd className="mt-1 text-ink-muted">{opportunity.risk}</dd></div>
+                  <div><dt className="text-ink-faint">Savings</dt><dd className="mt-1 text-ink-muted">Not available; no estimate or measurement is provided.</dd></div>
+                </dl>
+              </section>
+            ) : (
+              <ImpactCard
+                savingsMonthly={opportunity.impactMonthly}
+                risk={opportunity.risk}
+                rollbackAvailable={opportunity.rollbackAvailable}
+              />
+            )}
           </div>
         </div>
       )}
 
-      <Modal
-        open={reviewOpen}
-        onClose={() => setReviewOpen(false)}
-        title="Proposed change"
-        subtitle={opportunity ? `${opportunity.id} · ${opportunity.resource}` : undefined}
-      >
-        <p className="text-sm leading-relaxed text-ink-muted">
-          ACELO proposes a controlled configuration change scoped to this
-          resource only. The change does not run automatically — it requires
-          approval and executes through a checkpointed, rollback-protected
-          workflow. No implementation detail is executed without your explicit
-          approval in the Approval Center.
-        </p>
-        <div className="mt-5 flex justify-end">
-          <Button onClick={() => setReviewOpen(false)}>Close</Button>
-        </div>
-      </Modal>
+      {!opportunity?.stage1Recommendation && (
+        <Modal
+          open={reviewOpen}
+          onClose={() => setReviewOpen(false)}
+          title="Proposed change"
+          subtitle={opportunity ? `${opportunity.id} · ${opportunity.resource}` : undefined}
+        >
+          <p className="text-sm leading-relaxed text-ink-muted">
+            ACELO proposes a controlled configuration change scoped to this
+            resource only. The change does not run automatically — it requires
+            approval and executes through a checkpointed, rollback-protected
+            workflow. No implementation detail is executed without your explicit
+            approval in the Approval Center.
+          </p>
+          <div className="mt-5 flex justify-end">
+            <Button onClick={() => setReviewOpen(false)}>Close</Button>
+          </div>
+        </Modal>
+      )}
     </Layout>
   );
 }

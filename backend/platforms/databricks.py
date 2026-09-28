@@ -73,6 +73,13 @@ class DatabricksAdapter(PlatformAdapter):
         back to the Databricks App's own identity — which is how the App
         deployment authenticates without the user entering anything.
         """
+        delegated_token = getattr(self, "delegated_token", None)
+
+        if delegated_token:
+            return {
+            "Authorization": f"Bearer {delegated_token}",
+            "Content-Type": "application/json",
+        }
         if self.secret:
             return {"Authorization": f"Bearer {self.secret}", "Content-Type": "application/json"}
 

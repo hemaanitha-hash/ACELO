@@ -23,6 +23,7 @@ from models import (
 from platforms.base import PlatformCapabilityNotImplemented
 from platforms.errors import PlatformError
 from services import approval_service as approvals
+from services import stage1_approval_service as stage1_approvals
 from services import environment_service, provisioning_service
 
 router = APIRouter(prefix="/api/approvals", tags=["approvals"])
@@ -39,6 +40,10 @@ class CancelRequest(BaseModel):
 class FromRunRequest(BaseModel):
     job_run_id: str
     resource_id: str | None = None
+
+
+class Stage1RejectRequest(BaseModel):
+    reason: str
 
 
 def current_actor(
@@ -100,6 +105,84 @@ def onelake_token(x_onelake_token: str | None = Header(default=None)) -> str | N
 
 
 tracking_config = approvals.tracking_config
+
+
+def _stage1_actor(
+    x_acelo_user_id: str | None = Header(default=None),
+    x_acelo_user_name: str | None = Header(default=None),
+) -> tuple[str, str]:
+    user_id = (x_acelo_user_id or "").strip()
+    user_name = (x_acelo_user_name or "").strip()
+    if not user_id or not user_name:
+        raise HTTPException(status_code=401, detail="Sign in to review Stage 1 recommendations.")
+    return user_id[:200], user_name[:200]
+
+
+def _stage1_refused(exc: stage1_approvals.Stage1ApprovalError):
+    raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@router.get("/recommendations")
+def list_stage1_approvals(
+    status: str | None = None,
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+):
+    try:
+        return stage1_approvals.list_approvals(db, customer, status)
+    except stage1_approvals.Stage1ApprovalError as exc:
+        _stage1_refused(exc)
+
+
+@router.get("/recommendations/{recommendation_id}")
+def get_stage1_approval(
+    recommendation_id: str,
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+):
+    try:
+        return stage1_approvals.get_approval(db, customer, recommendation_id)
+    except stage1_approvals.Stage1ApprovalError as exc:
+        _stage1_refused(exc)
+
+
+@router.post("/recommendations/{recommendation_id}/request")
+def request_stage1_approval(
+    recommendation_id: str,
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+):
+    try:
+        return stage1_approvals.request_approval(db, customer, recommendation_id)
+    except stage1_approvals.Stage1ApprovalError as exc:
+        _stage1_refused(exc)
+
+
+@router.post("/recommendations/{recommendation_id}/approve")
+def approve_stage1_recommendation(
+    recommendation_id: str,
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+    actor: tuple[str, str] = Depends(_stage1_actor),
+):
+    try:
+        return stage1_approvals.approve(db, customer, recommendation_id, actor[0], actor[1])
+    except stage1_approvals.Stage1ApprovalError as exc:
+        _stage1_refused(exc)
+
+
+@router.post("/recommendations/{recommendation_id}/reject")
+def reject_stage1_recommendation(
+    recommendation_id: str,
+    payload: Stage1RejectRequest,
+    db: Session = Depends(get_db),
+    customer: Customer = Depends(get_current_customer),
+    actor: tuple[str, str] = Depends(_stage1_actor),
+):
+    try:
+        return stage1_approvals.reject(db, customer, recommendation_id, actor[0], actor[1], payload.reason)
+    except stage1_approvals.Stage1ApprovalError as exc:
+        _stage1_refused(exc)
 
 
 def _refused(exc: approvals.ApprovalError):

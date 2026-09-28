@@ -26,8 +26,9 @@ def ensure_columns() -> None:
 
     `Base.metadata.create_all()` creates missing TABLES but never adds missing
     COLUMNS to a table that already exists, so an existing ACELO database would
-    silently lack the Step 2 execution columns. This adds only what is missing
-    and never drops or alters anything, so it is safe to run on every startup.
+    silently lack additive columns. The Stage 1 recommendation extension also
+    rebuilds the legacy recommendations table with its rows preserved when its
+    required job_run_id must become nullable; this is safe to run on startup.
     """
     from sqlalchemy import inspect, text
 
@@ -64,12 +65,41 @@ def ensure_columns() -> None:
             "provisioning_detail_json": "TEXT",
             "last_provisioned_at": "DATETIME",
         },
+        "recommendations": {
+            "recommendation_id": "VARCHAR",
+            "customer_id": "VARCHAR",
+            "environment_id": "VARCHAR",
+            "workspace_name": "VARCHAR",
+            "resource_id": "VARCHAR",
+            "resource_type": "VARCHAR",
+            "finding_id": "VARCHAR",
+            "rule_id": "VARCHAR",
+            "finding_type": "VARCHAR",
+            "title": "VARCHAR",
+            "summary": "TEXT",
+            "description": "TEXT",
+            "proposed_state": "TEXT",
+            "evidence_json": "TEXT",
+            "evidence_references_json": "TEXT",
+            "evidence_quality_json": "TEXT",
+            "observation_window_json": "TEXT",
+            "expected_impact_json": "TEXT",
+            "estimated_savings_json": "TEXT",
+            "severity": "VARCHAR",
+            "risk": "VARCHAR",
+            "policy_status": "VARCHAR",
+            "approval_status": "VARCHAR",
+            "execution_status": "VARCHAR",
+            "verification_status": "VARCHAR",
+            "updated_at": "DATETIME",
+        },
     }
 
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
 
     _rebuild_if_empty_and_outdated(inspector, existing_tables)
+    _ensure_recommendation_run_nullable(engine)
     inspector = inspect(engine)
 
     with engine.begin() as conn:
@@ -80,6 +110,65 @@ def ensure_columns() -> None:
             for name, sql_type in columns.items():
                 if name not in present:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"))
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_recommendation_identity "
+            "ON recommendations (recommendation_id)"
+        ))
+
+
+def _ensure_recommendation_run_nullable(target_engine) -> None:
+    """Preserve legacy recommendation rows while making their run link optional."""
+    from sqlalchemy import MetaData, Table, inspect, insert, select, text
+
+    from models import Recommendation
+
+    inspector = inspect(target_engine)
+    if "recommendations" not in inspector.get_table_names():
+        return
+    columns = {column["name"]: column for column in inspector.get_columns("recommendations")}
+    job_run_id = columns.get("job_run_id")
+    if not job_run_id or job_run_id.get("nullable", True):
+        return
+
+    if target_engine.dialect.name == "sqlite":
+        with target_engine.connect() as connection:
+            connection.commit()
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.commit()
+            try:
+                with connection.begin():
+                    old = Table("recommendations", MetaData(), autoload_with=connection)
+                    replacement = Recommendation.__table__.to_metadata(
+                        Recommendation.metadata, name="recommendations_phase5"
+                    )
+                    try:
+                        replacement.create(connection)
+                        common_columns = [name for name in old.c.keys() if name in replacement.c]
+                        connection.execute(
+                            insert(replacement).from_select(
+                                common_columns,
+                                select(*(old.c[name] for name in common_columns)),
+                            )
+                        )
+                        connection.execute(text("DROP TABLE recommendations"))
+                        connection.execute(text(
+                            "ALTER TABLE recommendations_phase5 RENAME TO recommendations"
+                        ))
+                    finally:
+                        Recommendation.metadata.remove(replacement)
+            finally:
+                connection.commit()
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                connection.commit()
+        return
+
+    if target_engine.dialect.name == "postgresql":
+        with target_engine.begin() as connection:
+            connection.execute(text(
+                "ALTER TABLE recommendations ALTER COLUMN job_run_id DROP NOT NULL"
+            ))
 
 
 def _rebuild_if_empty_and_outdated(inspector, existing_tables: set[str]) -> None:

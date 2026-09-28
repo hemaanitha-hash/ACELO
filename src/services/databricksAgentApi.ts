@@ -11,7 +11,15 @@
 // completed — this module never advances a step on a timer.
 // ============================================================================
 
-import { isActive, platformHeaders } from "./platformContext";
+import {
+  getActiveContext,
+  isActive,
+  platformHeaders,
+  resolveInitial,
+  setActiveContext,
+} from "./platformContext";
+import { listPlatformConnections } from "./platformConnections";
+import { isDatabricksOnly } from "./experience";
 import { API_BASE } from "./apiBase";
 
 export type AgentStepStatus = "pending" | "done" | "failed";
@@ -54,6 +62,46 @@ export interface AgentAnalysis {
   missing_evidence: string[];
   opportunities: AgentOpportunity[];
   summary: string | null;
+  compute_optimization?: {
+    findings: Record<string, unknown>[];
+    recommendations: Stage1Recommendation[];
+    summary: Record<string, unknown>;
+  };
+}
+
+export interface Stage1Recommendation {
+  recommendation_id: string;
+  domain: "CLUSTER_SIZING" | "CLUSTER_RUNTIME" | "AUTOSCALING";
+  resource_type: "CLASSIC_CLUSTER";
+  resource_id: string;
+  resource_name: string;
+  finding_id: string;
+  rule_id: string;
+  finding_type: string;
+  title: string;
+  summary: string;
+  description: string;
+  evidence: Record<string, unknown>;
+  evidence_references: Record<string, unknown>[];
+  current_state: Record<string, unknown>;
+  proposed_state: { direction: string; reason: string };
+  expected_impact: { status: "POTENTIAL"; description: string };
+  estimated_savings: { status: "NOT_AVAILABLE"; estimated: null; measured: null };
+  confidence: "low" | "medium" | "high";
+  severity: "LOW" | "MEDIUM" | "HIGH";
+  risk: "LOW" | "MEDIUM" | "HIGH";
+  policy_status: string;
+  approval_status: string;
+  execution_status: string;
+  verification_status: string;
+  status: "OPEN";
+  customer_id: string;
+  environment_id: string;
+  workspace_name: string | null;
+  observation_window: { start: string | null; end: string | null };
+  evidence_quality: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface AgentAnalysisResult {
@@ -68,6 +116,26 @@ export interface AgentAnalysisResult {
 }
 
 export class AgentApiError extends Error {}
+
+async function ensureMvpDatabricksContext(): Promise<void> {
+  if (!isDatabricksOnly()) return;
+  const active = getActiveContext();
+  if (active.platform === "databricks" && active.connection?.platform === "databricks") return;
+
+  let connections;
+  try {
+    connections = await listPlatformConnections();
+  } catch {
+    setActiveContext(null);
+    throw new AgentApiError("Databricks connections could not be loaded. Verify the Databricks workspace connection and try again.");
+  }
+
+  const databricks = resolveInitial(connections, "databricks");
+  setActiveContext(databricks);
+  if (!databricks) {
+    throw new AgentApiError("No Databricks connection is configured for Stage 1. Connect a Databricks workspace to continue.");
+  }
+}
 
 /**
  * Whether this prompt asks the agent to analyse real Databricks compute.
@@ -100,6 +168,7 @@ export async function analyzeDatabricksCompute(
   prompt: string,
   environmentId?: string | null,
 ): Promise<AgentAnalysisResult> {
+  await ensureMvpDatabricksContext();
   let res: Response;
   try {
     res = await fetch(`${API_BASE}/databricks/agent/analyze`, {

@@ -6,7 +6,6 @@ httpx==0.28.1
 databricks-sdk==0.139.0
 msal
 pyodbc
-sqlalchemy
 pandas
 numpy
 xgboost
@@ -15,3 +14,4 @@ scikit-learn
 deltalake
 pyarrow
 SQLAlchemy>=2.0,<3.0
+respx

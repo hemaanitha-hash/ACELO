@@ -1,6 +1,6 @@
 {
   "package_name": "ACELO Optimization Package",
-  "package_version": "1.6.0",
+  "package_version": "1.7.0",
   "namespace": "ACELO",
   "description": "ACELO's optimization notebooks, deployed into a customer's Fabric workspace.",
   "assets": [
@@ -13,20 +13,20 @@
       "resource_key": "approval_tracking_notebook_id"
     },
     {
-      "domain": "cluster",
-      "folder": "Cluster",
-      "display_name": "ACELO Cluster Optimization",
-      "source": "cluster/Clusterfabric.ipynb",
-      "required": true,
-      "resource_key": "cluster_notebook_id"
-    },
-    {
       "domain": "query",
       "folder": "Query",
       "display_name": "ACELO Query Optimization",
-      "source": "query/query_optimization.ipynb",
+      "source": "query/deploy/QueryOptimization.ipynb",
       "required": false,
       "resource_key": "query_notebook_id"
+    },
+    {
+      "domain": "query_apply",
+      "folder": "Query",
+      "display_name": "ACELO Apply Approved Query",
+      "source": "query/deploy/ApplyApprovedQuery.ipynb",
+      "required": false,
+      "resource_key": "query_apply_notebook_id"
     },
     {
       "domain": "storage",
@@ -35,6 +35,14 @@
       "source": "storage/storage_optimization.ipynb",
       "required": false,
       "resource_key": "storage_notebook_id"
+    },
+    {
+      "domain": "cluster",
+      "folder": "Cluster",
+      "display_name": "ACELO Cluster Optimization",
+      "source": "cluster/Clusterfabric.ipynb",
+      "required": true,
+      "resource_key": "cluster_notebook_id"
     }
   ]
 }

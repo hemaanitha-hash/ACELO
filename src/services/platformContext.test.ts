@@ -87,6 +87,20 @@ describe("active platform context", () => {
     expect(resolveInitial([notConnected, FABRIC])?.id).toBe("fabric-prod");
     expect(resolveInitial([])).toBeNull();
   });
+
+  it("prefers Databricks in MVP mode despite Fabric ordering or remembered selection", () => {
+    setActiveContext(FABRIC);
+
+    expect(resolveInitial([FABRIC, DATABRICKS], "databricks")).toEqual(DATABRICKS);
+  });
+
+  it("returns no platform instead of falling back to Fabric when Databricks is absent", () => {
+    expect(resolveInitial([FABRIC], "databricks")).toBeNull();
+  });
+
+  it("keeps the existing all-platform resolution when no preference is supplied", () => {
+    expect(resolveInitial([FABRIC, DATABRICKS])?.id).toBe("fabric-prod");
+  });
 });
 
 describe("generic AI requests resolve within the active platform", () => {

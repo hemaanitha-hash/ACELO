@@ -83,7 +83,7 @@ _FATAL_STATUS_BY_ERROR_CODE = {
 }
 
 
-async def discover_databricks_resources(db: Session, environment: Environment) -> CapabilityResult:
+async def discover_databricks_resources(db: Session, environment: Environment, access_token: str | None = None) -> CapabilityResult:
     """
     Discovers the real compute resources visible to the environment's Databricks
     identity: classic clusters, serverless compute and SQL warehouses.
@@ -110,7 +110,7 @@ async def discover_databricks_resources(db: Session, environment: Environment) -
         )
 
     try:
-        adapter = environment_service.build_adapter(db, environment)
+        adapter = environment_service.build_adapter(db, environment,delegated_token=access_token)
         discovery = await adapter.discover_compute_resources()
     except PlatformError as exc:
         status = _FATAL_STATUS_BY_ERROR_CODE.get(exc.code, CapabilityStatus.DISCOVERY_FAILED)

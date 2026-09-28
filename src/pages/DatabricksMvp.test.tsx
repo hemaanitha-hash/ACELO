@@ -6,7 +6,13 @@ import Sidebar from "../components/Sidebar";
 import Settings from "./Settings";
 import App from "../App";
 import { setRuntime } from "../services/runtime";
-import { resetActiveContext } from "../services/platformContext";
+import {
+  getActiveContext,
+  platformHeaders,
+  resetActiveContext,
+  setActiveContext,
+  type PlatformConnection,
+} from "../services/platformContext";
 
 /**
  * The Databricks-only MVP.
@@ -50,14 +56,24 @@ vi.mock("../services/environmentApi", async () => {
   };
 });
 
+const platformConnectionFixtures = vi.hoisted(() => ({
+  rows: [] as Array<{
+    id: string;
+    platform: "databricks" | "fabric";
+    name: string;
+    status: string;
+  }>,
+}));
+
 vi.mock("../services/platformConnections", () => ({
-  listPlatformConnections: vi.fn(async () => []),
+  listPlatformConnections: vi.fn(async () => platformConnectionFixtures.rows),
 }));
 
 const WORKSPACE = "https://adb-7405617514546966.6.azuredatabricks.net";
 
 beforeEach(() => {
   resetActiveContext();
+  platformConnectionFixtures.rows = [];
   setRuntime({
     databricks_app: true,
     workspace_host: WORKSPACE,
@@ -106,6 +122,55 @@ describe("Databricks-only navigation", () => {
     // No switcher: there is nothing to switch to.
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(screen.queryByText("Microsoft Fabric")).not.toBeInTheDocument();
+  });
+
+  it("selects Databricks when Fabric is first and a Fabric connection was remembered", async () => {
+    const fabric: PlatformConnection = {
+      id: "fabric-first",
+      platform: "fabric",
+      name: "Fabric first",
+      status: "connected",
+    };
+    const databricks: PlatformConnection = {
+      id: "db-second",
+      platform: "databricks",
+      name: "Databricks second",
+      status: "connected",
+    };
+    platformConnectionFixtures.rows = [fabric, databricks].map(
+  ({ id, platform, name, status }) => ({
+    id,
+    platform,
+    name,
+    status: status ?? "",
+  })
+);
+    setActiveContext(fabric);
+
+    renderSidebar();
+
+    await waitFor(() => expect(getActiveContext().connection?.id).toBe("db-second"));
+    expect(getActiveContext().platform).toBe("databricks");
+    expect(platformHeaders()).toEqual({
+      "X-Acelo-Platform": "databricks",
+      "X-Acelo-Connection-Id": "db-second",
+    });
+  });
+
+  it("does not select Fabric when no Databricks connection exists", async () => {
+    platformConnectionFixtures.rows = [{
+      id: "fabric-only",
+      platform: "fabric",
+      name: "Fabric only",
+      status: "connected",
+    }];
+    setActiveContext(platformConnectionFixtures.rows[0]);
+
+    renderSidebar();
+
+    await waitFor(() => expect(getActiveContext().connection).toBeNull());
+    expect(getActiveContext().platform).toBeNull();
+    expect(platformHeaders()).toEqual({});
   });
 });
 

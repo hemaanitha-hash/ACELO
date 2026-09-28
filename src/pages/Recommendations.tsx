@@ -13,7 +13,7 @@ import { isDatabricksOnly } from "../services/experience";
 import {
   AgentApiError,
   type AgentOpportunity,
-  type Stage1Recommendation,
+  type Stage1Recommendation as ApiStage1Recommendation,
 } from "../services/databricksAgentApi";
 import {
   ensureComputeAnalysis,
@@ -56,6 +56,66 @@ const TYPE_LABELS: Record<string, string> = {
 };
 
 type ApprovalUiState = "OPEN" | "PENDING" | "APPROVED" | "REJECTED";
+
+type Stage1Recommendation = ApiStage1Recommendation & {
+  // The persisted recommendation contract uses `resource_name` in some
+  // versions and `resource` in others. Keep this optional so the frontend
+  // remains compatible with the existing API type without inventing data.
+  resource?: string;
+};
+
+type AgentAnalysisWithStage1 =
+  NonNullable<
+    NonNullable<ComputeAnalysisState["result"]>["analysis"]
+  > & {
+    compute_optimization?: {
+      recommendations?: Stage1Recommendation[];
+    };
+  };
+
+function formatValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "Not available.";
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function getProposedState(value: unknown): {
+  direction: string;
+  reason: string;
+} {
+  if (value && typeof value === "object") {
+    const state = value as { direction?: unknown; reason?: unknown };
+    return {
+      direction: formatValue(state.direction),
+      reason: formatValue(state.reason),
+    };
+  }
+
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as { direction?: unknown; reason?: unknown };
+      return {
+        direction: formatValue(parsed.direction),
+        reason: formatValue(parsed.reason),
+      };
+    } catch {
+      return {
+        direction: value,
+        reason: "Not available.",
+      };
+    }
+  }
+
+  return {
+    direction: "Not available.",
+    reason: "Not available.",
+  };
+}
 
 async function requestStage1Approval(recommendationId: string): Promise<void> {
   const response = await fetch(
@@ -135,7 +195,9 @@ function DatabricksRecommendations() {
   }, []);
 
   const result = state.result;
-  const analysis = result?.analysis ?? null;
+  const analysis = result?.analysis
+    ? (result.analysis as AgentAnalysisWithStage1)
+    : null;
   const opportunities = analysis?.opportunities ?? [];
   const stage1Recommendations =
     analysis?.compute_optimization?.recommendations ?? [];
@@ -411,62 +473,88 @@ function RecommendationItem({
 
 function Stage1RecommendationItem({
   recommendation,
+  approvalState,
+  requesting,
+  error,
+  onSendToApproval,
 }: {
   recommendation: Stage1Recommendation;
+  approvalState: ApprovalUiState;
+  requesting: boolean;
+  error: string | null;
+  onSendToApproval: () => Promise<void>;
 }) {
   const navigate = useNavigate();
-  const [requesting, setRequesting] = useState(false);
-  const [requested, setRequested] = useState(
-    recommendation.status?.toUpperCase() === "PENDING_APPROVAL",
-  );
-  const [error, setError] = useState<string | null>(null);
+  const proposedState = getProposedState(recommendation.proposed_state);
+
+  const expectedImpact =
+    recommendation.expected_impact &&
+    typeof recommendation.expected_impact === "object" &&
+    "description" in recommendation.expected_impact
+      ? formatValue(
+          (recommendation.expected_impact as { description?: unknown })
+            .description,
+        )
+      : formatValue(recommendation.expected_impact);
 
   const rows: { label: string; value: string; mono?: boolean }[] = [
-    { label: "Finding", value: recommendation.finding_type },
-    { label: "Rule", value: recommendation.rule_id, mono: true },
-    { label: "Summary", value: recommendation.summary },
+    {
+      label: "Finding",
+      value: formatValue(recommendation.finding_type),
+    },
+    {
+      label: "Rule",
+      value: formatValue(recommendation.rule_id),
+      mono: true,
+    },
+    {
+      label: "Summary",
+      value: formatValue(recommendation.summary),
+    },
     {
       label: "Observed evidence",
-      value: JSON.stringify(recommendation.evidence),
+      value: formatValue(recommendation.evidence),
       mono: true,
     },
     {
       label: "Evidence reference",
-      value: JSON.stringify(recommendation.evidence_references),
+      value: formatValue(recommendation.evidence_references),
       mono: true,
     },
     {
       label: "Current state",
-      value: JSON.stringify(recommendation.current_state),
+      value: formatValue(recommendation.current_state),
       mono: true,
     },
     {
       label: "Proposed direction",
-      value: recommendation.proposed_state.direction,
+      value: proposedState.direction,
     },
     {
       label: "Direction rationale",
-      value: recommendation.proposed_state.reason,
+      value: proposedState.reason,
     },
     {
       label: "Expected impact",
-      value: recommendation.expected_impact.description,
+      value: expectedImpact,
     },
     {
       label: "Evidence quality",
-      value: JSON.stringify(recommendation.evidence_quality),
+      value: formatValue(recommendation.evidence_quality),
       mono: true,
     },
     {
       label: "Observation window",
-      value: `${recommendation.observation_window.start ?? "Not available"} to ${
-        recommendation.observation_window.end ?? "Not available"
+      value: `${recommendation.observation_window?.start ?? "Not available"} to ${
+        recommendation.observation_window?.end ?? "Not available"
       }`,
       mono: true,
     },
     {
       label: "Confidence / severity / risk",
-      value: `${recommendation.confidence} / ${recommendation.severity} / ${recommendation.risk}`,
+      value: `${formatValue(recommendation.confidence)} / ${formatValue(
+        recommendation.severity,
+      )} / ${formatValue(recommendation.risk)}`,
     },
     {
       label: "Savings",
@@ -474,55 +562,9 @@ function Stage1RecommendationItem({
     },
   ];
 
-  async function sendToApproval() {
-    if (requesting || requested) return;
-
-    setRequesting(true);
-    setError(null);
-
-    try {
-      const response = await fetch(
-        `/api/approvals/recommendations/${encodeURIComponent(
-          recommendation.recommendation_id,
-        )}/request`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-        },
-      );
-
-      const text = await response.text();
-
-      if (!response.ok) {
-        let message = `Unable to send recommendation to approval (HTTP ${response.status}).`;
-
-        try {
-          const body = JSON.parse(text) as { detail?: string };
-          if (body.detail) message = body.detail;
-        } catch {
-          // Keep the HTTP fallback message when the response is not JSON.
-        }
-
-        throw new Error(message);
-      }
-
-      setRequested(true);
-
-      // Move directly to the Approval Center so the demo follows
-      // Recommendations → Approval Center.
-      navigate("/approvals");
-    } catch (e: unknown) {
-      setError(
-        e instanceof Error
-          ? e.message
-          : "Unable to send this recommendation for approval.",
-      );
-    } finally {
-      setRequesting(false);
-    }
-  }
+  const isPending = approvalState === "PENDING";
+  const isApproved = approvalState === "APPROVED";
+  const isRejected = approvalState === "REJECTED";
 
   return (
     <li className="overflow-hidden rounded-2xl border border-red-100 bg-white shadow-sm">
@@ -532,13 +574,21 @@ function Stage1RecommendationItem({
             {recommendation.title}
           </p>
           <p className="mt-1 text-xs text-ink-faint">
-            {recommendation.resource_name} · {recommendation.resource_id} ·{" "}
+            {recommendation.resource} · {recommendation.resource_id} ·{" "}
             {recommendation.domain.replace(/_/g, " ")}
           </p>
         </div>
 
         <StatusBadge
-          label={requested ? "PENDING APPROVAL" : "OPEN · REPORTING ONLY"}
+          label={
+            isPending
+              ? "PENDING APPROVAL"
+              : isApproved
+                ? "APPROVED"
+                : isRejected
+                  ? "REJECTED"
+                  : "OPEN · REPORTING ONLY"
+          }
           kind="status"
           className="shrink-0"
         />
@@ -576,10 +626,20 @@ function Stage1RecommendationItem({
 
       <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-red-50 bg-red-50/30 px-6 py-4">
         <div className="flex items-center gap-2 text-xs text-ink-faint">
-          {requested ? (
+          {isPending ? (
             <>
               <Clock3 size={15} />
               Waiting for human approval
+            </>
+          ) : isApproved ? (
+            <>
+              <CheckCircle2 size={15} />
+              Approved — workflow stops here in the MVP
+            </>
+          ) : isRejected ? (
+            <>
+              <Clock3 size={15} />
+              Rejected — workflow stops here in the MVP
             </>
           ) : (
             <>
@@ -589,7 +649,7 @@ function Stage1RecommendationItem({
           )}
         </div>
 
-        {requested ? (
+        {isPending ? (
           <button
             type="button"
             onClick={() => navigate("/approvals")}
@@ -598,17 +658,17 @@ function Stage1RecommendationItem({
             <Clock3 size={16} />
             Open Approval Center
           </button>
-        ) : (
+        ) : approvalState === "OPEN" ? (
           <button
             type="button"
-            onClick={() => void sendToApproval()}
+            onClick={() => void onSendToApproval()}
             disabled={requesting}
             className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <Send size={16} />
             {requesting ? "Sending…" : "Send to Approval"}
           </button>
-        )}
+        ) : null}
       </footer>
     </li>
   );

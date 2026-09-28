@@ -235,20 +235,50 @@ class JobLog(Base):
 
 class Recommendation(Base):
     __tablename__ = "recommendations"
+    __table_args__ = (
+        UniqueConstraint("recommendation_id", name="uq_recommendation_identity"),
+    )
 
     id = Column(String, primary_key=True, default=_id)
-    job_run_id = Column(String, ForeignKey("job_runs.id"), nullable=False)
+    job_run_id = Column(String, ForeignKey("job_runs.id"), nullable=True)
+
+    recommendation_id = Column(String, nullable=True, index=True)
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=True, index=True)
+    environment_id = Column(String, ForeignKey("environments.id"), nullable=True, index=True)
+    workspace_name = Column(String, nullable=True)
+    resource_id = Column(String, nullable=True, index=True)
+    resource_type = Column(String, nullable=True)
+    finding_id = Column(String, nullable=True, index=True)
+    rule_id = Column(String, nullable=True)
+    finding_type = Column(String, nullable=True)
+    title = Column(String, nullable=True)
+    summary = Column(Text, nullable=True)
+    description = Column(Text, nullable=True)
 
     resource = Column(String, nullable=False)
     domain = Column(String, nullable=False)
     current_state = Column(Text, nullable=True)
     proposed_change = Column(Text, nullable=False)
-    estimated_monthly_savings = Column(Float, default=0)
-    current_monthly_cost = Column(Float, default=0)
+    proposed_state = Column(Text, nullable=True)
+    evidence_json = Column(Text, nullable=True)
+    evidence_references_json = Column(Text, nullable=True)
+    evidence_quality_json = Column(Text, nullable=True)
+    observation_window_json = Column(Text, nullable=True)
+    expected_impact_json = Column(Text, nullable=True)
+    estimated_savings_json = Column(Text, nullable=True)
+    estimated_monthly_savings = Column(Float, nullable=True)
+    current_monthly_cost = Column(Float, nullable=True)
     confidence = Column(String, default="medium")  # "low" | "medium" | "high"
-    status = Column(String, default="open")  # "open" | "approval_pending" | "approved" | "rejected" | "executed"
+    status = Column(String, default="open")  # legacy statuses lowercase; Stage 1 records start at OPEN
+    severity = Column(String, nullable=True)
+    risk = Column(String, nullable=True)
+    policy_status = Column(String, nullable=True)
+    approval_status = Column(String, nullable=True)
+    execution_status = Column(String, nullable=True)
+    verification_status = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ApprovalRequest(Base):

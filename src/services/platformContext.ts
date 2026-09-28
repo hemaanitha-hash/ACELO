@@ -81,13 +81,19 @@ export function rememberedConnectionId(): string | null {
  * Picks which connection should be active given what the backend reports.
  * Prefers the remembered one, then a connected one, then the first.
  */
-export function resolveInitial(connections: PlatformConnection[]): PlatformConnection | null {
-  if (connections.length === 0) return null;
+export function resolveInitial(
+  connections: PlatformConnection[],
+  preferredPlatform?: ActivePlatformId,
+): PlatformConnection | null {
+  const candidates = preferredPlatform
+    ? connections.filter((connection) => connection.platform === preferredPlatform)
+    : connections;
+  if (candidates.length === 0) return null;
   const remembered = rememberedConnectionId();
   return (
-    connections.find((c) => c.id === remembered) ??
-    connections.find((c) => c.status === "connected") ??
-    connections[0]
+    candidates.find((c) => c.id === remembered) ??
+    candidates.find((c) => c.status === "connected") ??
+    candidates[0]
   );
 }
 

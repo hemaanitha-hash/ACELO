@@ -27,6 +27,7 @@ class DatabricksSQLReader:
     def __init__(
         self,
         warehouse_id: str | None = None,
+        access_token: str | None = None,
         timeout: float = 45.0,
     ) -> None:
         self.warehouse_id = (
@@ -199,19 +200,25 @@ class DatabricksSQLReader:
             f"SELECT * FROM {table}"
         )
 
-    async def read_compute_evidence(self) -> dict[str, list[dict[str, Any]]]:
+    async def read_compute_evidence(self) -> dict[str, Any]:
         """
-        Read the complete evidence set required by the Compute Optimization
-        engine.
+        Read each approved evidence table independently so one unavailable
+        source does not discard successful reads from the other tables.
         """
-
-        return {
-            "cluster": await self.read_table("cluster"),
-            "node_timeline": await self.read_table("node_timeline"),
-            "node_types": await self.read_table("node_types"),
-            "instance_events": await self.read_table("instance_events"),
-            "billing_usage": await self.read_table("billing_usage"),
-            "job_task_run_timeline": await self.read_table(
-                "job_task_run_timeline"
-            ),
-        }
+        evidence: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        for table_name in (
+            "cluster",
+            "node_timeline",
+            "node_types",
+            "instance_events",
+            "billing_usage",
+            "job_task_run_timeline",
+        ):
+            try:
+                evidence[table_name] = await self.read_table(table_name)
+            except DatabricksSQLReaderError:
+                evidence[table_name] = []
+                errors[table_name] = "READ_FAILED"
+        evidence["errors"] = errors
+        return evidence
