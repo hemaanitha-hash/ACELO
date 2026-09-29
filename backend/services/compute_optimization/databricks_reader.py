@@ -44,11 +44,21 @@ class DatabricksSQLReader:
         ).rstrip("/")
 
     def _headers(self) -> dict[str, str]:
+        """
+        Build the authorization headers.
+
+        Priority:
+          1. Explicit access token supplied by the caller.
+          2. Native Databricks App identity.
+
+        Credentials are never returned as part of the evidence payload.
+        """
         if self.access_token:
             return {
-            "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
-        }
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json",
+            }
+
         headers = databricks_auth.app_auth_headers()
 
         if not headers:
@@ -62,6 +72,7 @@ class DatabricksSQLReader:
         }
 
     def _validate(self) -> None:
+        """Validate that the SQL reader has the required runtime configuration."""
         if not self.endpoint:
             raise DatabricksSQLReaderError(
                 "Databricks workspace endpoint is not configured."
@@ -202,23 +213,32 @@ class DatabricksSQLReader:
 
     async def read_compute_evidence(self) -> dict[str, Any]:
         """
-        Read each approved evidence table independently so one unavailable
-        source does not discard successful reads from the other tables.
+        Read each approved evidence table independently.
+
+        A failure in one source does not discard successful reads from the
+        other sources. Failed sources are represented by the sanitized
+        READ_FAILED status rather than exposing raw exception text.
         """
+
         evidence: dict[str, Any] = {}
         errors: dict[str, str] = {}
-        for table_name in (
+
+        evidence_tables = (
             "cluster",
             "node_timeline",
             "node_types",
             "instance_events",
             "billing_usage",
             "job_task_run_timeline",
-        ):
+        )
+
+        for table_name in evidence_tables:
             try:
                 evidence[table_name] = await self.read_table(table_name)
-            except DatabricksSQLReaderError as exc:
+            except DatabricksSQLReaderError:
                 evidence[table_name] = []
-                errors[table_name] = str(exc)
+                errors[table_name] = "READ_FAILED"
+
         evidence["errors"] = errors
+
         return evidence

@@ -20,6 +20,7 @@ show progress that did not happen.
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -185,26 +186,169 @@ def _steps() -> dict[str, Step]:
     }
 
 
-def _cluster_configuration(resource: dict[str, Any], sql_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], bool]:
+def _classic_cluster_listing_unavailable(
+    statuses: list[dict[str, Any]] | None,
+) -> bool:
+    """
+    Return True only when discovery explicitly indicates that the classic
+    cluster listing is unavailable.
+
+    This is deliberately stricter than checking `resources == []`.
+
+    An empty resource list can mean "there are no live classic clusters".
+    We must not manufacture table-backed inventory in that case because the
+    existing discovery contract/tests intentionally distinguish an empty
+    workspace from a forbidden/unavailable cluster listing.
+
+    The production Databricks App case is different: the workspace can return
+    a capability status indicating that classic-cluster discovery is forbidden,
+    unavailable, unauthorized, or otherwise inaccessible. In that case the
+    real databricks_ws.agent.cluster table is a valid Stage 1 inventory source.
+    """
+    for item in statuses or []:
+        if not isinstance(item, dict):
+            continue
+
+        resource_type = str(
+            item.get("resource_type")
+            or item.get("resourceType")
+            or item.get("resource")
+            or item.get("type")
+            or ""
+        ).upper()
+
+        # Match the classic-cluster capability without assuming one exact
+        # field naming convention.
+        is_classic_cluster = (
+            "CLASSIC_CLUSTER" in resource_type
+            or resource_type == "CLUSTER"
+            or resource_type.endswith("_CLUSTER")
+        )
+        if not is_classic_cluster:
+            continue
+
+        if item.get("ok") is False or item.get("available") is False:
+            return True
+
+        status_text = str(
+            item.get("status")
+            or item.get("state")
+            or item.get("status_code")
+            or item.get("code")
+            or ""
+        ).lower()
+
+        message_text = str(
+            item.get("message")
+            or item.get("detail")
+            or item.get("error")
+            or ""
+        ).lower()
+
+        combined = f"{status_text} {message_text}"
+
+        unavailable_markers = (
+            "forbidden",
+            "unauthorized",
+            "permission",
+            "not_permitted",
+            "not permitted",
+            "not_authorized",
+            "not authorized",
+            "unavailable",
+            "not available",
+            "access denied",
+            "access_denied",
+            "403",
+        )
+
+        if any(marker in combined for marker in unavailable_markers):
+            return True
+
+    return False
+
+def _resolve_sql_warehouse_id(
+    resources: list[dict[str, Any]] | None,
+) -> str | None:
+    """
+    Resolve the SQL warehouse used by the read-only evidence reader.
+
+    Priority:
+      1. Explicit ACELO_DATABRICKS_SQL_WAREHOUSE_ID configuration.
+      2. A SQL_WAREHOUSE discovered from the active Databricks workspace.
+
+    The agent never hardcodes a warehouse ID.
+    """
+    configured = os.getenv(
+        "ACELO_DATABRICKS_SQL_WAREHOUSE_ID",
+        "",
+    ).strip()
+
+    if configured:
+        return configured
+
+    warehouse_ids: list[str] = []
+
+    for resource in resources or []:
+        if not isinstance(resource, dict):
+            continue
+
+        resource_type = str(
+            resource.get("resource_type") or ""
+        ).upper()
+
+        if resource_type != "SQL_WAREHOUSE":
+            continue
+
+        resource_id = resource.get("resource_id")
+
+        if resource_id is None or str(resource_id).strip() == "":
+            continue
+
+        warehouse_ids.append(str(resource_id).strip())
+
+    if not warehouse_ids:
+        return None
+
+    return sorted(set(warehouse_ids))[0]
+
+def _cluster_configuration(
+    resource: dict[str, Any],
+    sql_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
     resource_id = resource.get("resource_id")
+
     sql_cluster = next(
-        (row for row in sql_rows if row.get("cluster_id") == resource_id),
+        (
+            row
+            for row in sql_rows
+            if str(row.get("cluster_id") or "") == str(resource_id or "")
+        ),
         None,
     )
+
     configuration = dict(sql_cluster or {})
     metadata = resource.get("metadata") or {}
 
     configuration.setdefault("cluster_id", resource_id)
     configuration.setdefault("cluster_name", resource.get("name"))
+
     if configuration.get("worker_count") is None:
         configuration["worker_count"] = metadata.get("num_workers")
+
     autoscaling = metadata.get("autoscaling") or {}
+
     if configuration.get("min_autoscale_workers") is None:
         configuration["min_autoscale_workers"] = autoscaling.get("min_workers")
+
     if configuration.get("max_autoscale_workers") is None:
         configuration["max_autoscale_workers"] = autoscaling.get("max_workers")
+
     if configuration.get("auto_termination_minutes") is None:
-        configuration["auto_termination_minutes"] = metadata.get("auto_termination_minutes")
+        configuration["auto_termination_minutes"] = metadata.get(
+            "auto_termination_minutes"
+        )
+
     return configuration, sql_cluster is not None
 
 
@@ -217,11 +361,14 @@ def _compute_evidence_for_cluster(
     collected_at: str,
 ) -> ComputeEvidence:
     cluster_id = resource.get("resource_id")
+
     cluster, cluster_row_available = _cluster_configuration(
         resource,
         evidence_rows.get("cluster", []),
     )
+
     raw_timeline = evidence_rows.get("node_timeline", [])
+
     normalized = (
         normalize_node_timeline(cluster_id, raw_timeline)
         if cluster_id
@@ -231,41 +378,60 @@ def _compute_evidence_for_cluster(
             error="Discovered cluster has no resource ID.",
         )
     )
+
     errors = evidence_rows.get("errors", {})
+
     task_rows = [
         row
         for row in evidence_rows.get("job_task_run_timeline", [])
-        if row.get("cluster_id") == cluster_id
+        if str(row.get("cluster_id") or "") == str(cluster_id or "")
     ]
-    runtime = derive_post_task_idle(
-        cluster_id or "",
-        normalized.utilization,
-        task_rows,
-        idle_cpu_threshold=IDLE_CPU,
-        idle_memory_threshold=IDLE_MEMORY,
-    ) or {}
+
+    runtime = (
+        derive_post_task_idle(
+            cluster_id or "",
+            normalized.utilization,
+            task_rows,
+            idle_cpu_threshold=IDLE_CPU,
+            idle_memory_threshold=IDLE_MEMORY,
+        )
+        or {}
+    )
 
     node_source_failed = errors.get("node_timeline") == "READ_FAILED"
-    missing_fields = []
+
+    missing_fields: list[str] = []
+
     if not cluster_row_available:
         missing_fields.append("cluster_sql_row")
+
     if node_source_failed or not normalized.utilization:
         missing_fields.append("node_timeline")
+
     if not normalized.worker_history_available:
         missing_fields.append("worker_history")
+
     if not runtime:
         missing_fields.append("task_to_idle_mapping")
+
     for table_name, state in errors.items():
         if state == "READ_FAILED" and table_name not in missing_fields:
             missing_fields.append(f"{table_name}")
 
-    notes = []
+    notes: list[str] = []
+
     if normalized.error:
         notes.append(normalized.error)
+
     if node_source_failed:
         notes.append("Node timeline source failed to read.")
+
     if not runtime:
-        notes.append("No exact same-cluster task-end to contiguous idle-bucket mapping was available.")
+        notes.append(
+            "No exact same-cluster task-end to contiguous idle-bucket "
+            "mapping was available."
+        )
+
     quality = EvidenceQuality(
         source_available=bool(cluster_id),
         completeness=(
@@ -284,15 +450,17 @@ def _compute_evidence_for_cluster(
         missing_fields=missing_fields,
         notes=" ".join(notes),
     )
+
     starts = [row["start_time"] for row in normalized.utilization]
     ends = [row["end_time"] for row in normalized.utilization]
+
     return ComputeEvidence(
         cluster=cluster,
         utilization=normalized.utilization,
         billing=[
             dict(row)
             for row in evidence_rows.get("billing_usage", [])
-            if row.get("cluster_id") == cluster_id
+            if str(row.get("cluster_id") or "") == str(cluster_id or "")
         ],
         worker_levels=normalized.worker_levels,
         runtime=runtime,
@@ -348,7 +516,8 @@ async def analyze_databricks_compute(
         # marks the auth step failed and leaves everything after it pending.
         failed_step = (
             "auth"
-            if result.status in (
+            if result.status
+            in (
                 CapabilityStatus.AUTHENTICATION_FAILED,
                 CapabilityStatus.AUTHORIZATION_FAILED,
                 CapabilityStatus.NOT_CONFIGURED,
@@ -367,7 +536,7 @@ async def analyze_databricks_compute(
             environment_id=environment.id,
         )
 
-    # The credential worked: at least one resource type was listed.
+    # The credential worked.
     steps["auth"].status = StepStatus.DONE
     steps["discover"].status = StepStatus.DONE
 
@@ -377,10 +546,17 @@ async def analyze_databricks_compute(
     steps["resources"].status = StepStatus.DONE
     steps["resources"].detail = f"{len(resources)} resource(s)"
 
+    # ------------------------------------------------------------------
     # Read compute evidence through Databricks SQL.
+    #
+    # These are the actual ACELO evidence sources.
+    # ------------------------------------------------------------------
+    sql_warehouse_id = _resolve_sql_warehouse_id(resources)
+
     reader = DatabricksSQLReader(
-        access_token=access_token,
-    )
+    warehouse_id=sql_warehouse_id,
+    access_token=access_token,
+)
 
     evidence_tables = (
         "cluster",
@@ -390,23 +566,34 @@ async def analyze_databricks_compute(
         "billing_usage",
         "job_task_run_timeline",
     )
+
     try:
         evidence_rows = await reader.read_compute_evidence()
     except Exception:
-        logger.exception("agent_compute_evidence_read_failed env_id=%s", environment.id)
+        logger.exception(
+            "agent_compute_evidence_read_failed env_id=%s",
+            environment.id,
+        )
         evidence_rows = {table: [] for table in evidence_tables}
-        evidence_rows["errors"] = {table: "READ_FAILED" for table in evidence_tables}
+        evidence_rows["errors"] = {
+            table: "READ_FAILED"
+            for table in evidence_tables
+        }
 
-        # ------------------------------------------------------------------
-    # Stage 1 demo cluster inventory
+    # ------------------------------------------------------------------
+    # Stage 1 compute inventory
     #
-    # Prefer live classic-cluster discovery when it is available.
-    # For the current demo workspace, classic-cluster listing is not
-    # permitted, so use the existing Databricks evidence table
-    # `databricks_ws.agent.cluster` as the authoritative cluster inventory.
+    # Preserve the existing REST discovery contract by default.
     #
-    # This is still real Databricks workspace data. No cluster is created,
-    # modified, started, stopped, or otherwise mutated.
+    # IMPORTANT:
+    # A table-backed inventory is used only when Databricks explicitly tells
+    # us that classic-cluster discovery is unavailable. We do NOT treat a
+    # merely empty resource list as permission failure.
+    #
+    # This allows the existing discovery tests to remain valid while allowing
+    # the Databricks App demo workspace to analyze the real
+    # databricks_ws.agent.cluster table when classic-cluster listing is
+    # unavailable.
     # ------------------------------------------------------------------
     discovered_clusters = sorted(
         (
@@ -419,7 +606,10 @@ async def analyze_databricks_compute(
 
     cluster_inventory_source = "databricks_discovery"
 
-    if not discovered_clusters:
+    if (
+        not discovered_clusters
+        and _classic_cluster_listing_unavailable(statuses)
+    ):
         table_clusters: dict[str, dict[str, Any]] = {}
 
         for row in evidence_rows.get("cluster", []):
@@ -430,13 +620,13 @@ async def analyze_databricks_compute(
 
             cluster_id = str(cluster_id).strip()
 
-            # One evidence-table row per cluster is enough to build the
-            # Stage 1 demo inventory. Keep the first valid row so that
-            # repeated source rows do not create duplicate resources.
+            # Keep one inventory record per cluster. The evidence table may
+            # contain multiple observations for the same cluster.
             if cluster_id in table_clusters:
                 continue
 
             cluster_name = row.get("cluster_name")
+
             if cluster_name is None or str(cluster_name).strip() == "":
                 cluster_name = cluster_id
 
@@ -451,7 +641,9 @@ async def analyze_databricks_compute(
 
         discovered_clusters = sorted(
             table_clusters.values(),
-            key=lambda resource: str(resource.get("resource_id") or ""),
+            key=lambda resource: str(
+                resource.get("resource_id") or ""
+            ),
         )
 
         if discovered_clusters:
@@ -467,6 +659,16 @@ async def analyze_databricks_compute(
                 f"{len(discovered_clusters)} Stage 1 cluster(s) "
                 "from databricks_ws.agent.cluster"
             )
+        else:
+            steps["discover"].detail = (
+                "Live classic-cluster listing unavailable and "
+                "databricks_ws.agent.cluster returned no usable cluster rows."
+            )
+
+            steps["resources"].detail = (
+                "0 Stage 1 clusters available from "
+                "databricks_ws.agent.cluster"
+            )
 
     discovered_ids = {
         resource.get("resource_id")
@@ -474,10 +676,26 @@ async def analyze_databricks_compute(
         if resource.get("resource_id")
     }
 
-    collected_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    cluster_results = []
+    collected_at = (
+        datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    cluster_results: list[dict[str, Any]] = []
     all_findings = []
 
+    # ------------------------------------------------------------------
+    # Evidence-backed Stage 1 analysis.
+    #
+    # Every cluster here is either:
+    #   1. a real REST-discovered classic cluster, or
+    #   2. a real cluster row from databricks_ws.agent.cluster when the
+    #      classic-cluster API is explicitly unavailable.
+    #
+    # Utilization, worker history, runtime, billing and task evidence are
+    # always read from the approved databricks_ws.agent.* tables.
+    # ------------------------------------------------------------------
     for resource in discovered_clusters:
         evidence = _compute_evidence_for_cluster(
             environment=environment,
@@ -486,38 +704,65 @@ async def analyze_databricks_compute(
             workspace_name=result.data.get("workspace_name"),
             collected_at=collected_at,
         )
+
         cluster_result = analyze_compute_evidence(
             evidence,
             evidence_source="databricks_sql",
         )
-        all_findings.extend(cluster_result.findings)
-        cluster_results.append({
-            "cluster_id": resource.get("resource_id"),
-            "cluster_name": resource.get("name"),
-            "lineage": dict(evidence.lineage),
-            "collected_at": evidence.collected_at,
-            "evidence_quality": {
-                "source_available": evidence.quality.source_available,
-                "completeness": evidence.quality.completeness,
-                "freshness": evidence.quality.freshness,
-                "timestamp_valid": evidence.quality.timestamp_valid,
-                "consistency": evidence.quality.consistency,
-                "missing_fields": evidence.quality.missing_fields,
-                "notes": evidence.quality.notes,
-            },
-            "observation_start": evidence.observation_start,
-            "observation_end": evidence.observation_end,
-            "runtime_activity_state": cluster_result.summary["runtime_activity_state"],
-            "rule_evaluations": cluster_result.summary["rule_evaluations"],
-            "findings_count": len(cluster_result.findings),
-        })
 
-    unmatched_rows = {}
-    for table_name in ("cluster", "node_timeline", "billing_usage", "job_task_run_timeline"):
+        all_findings.extend(cluster_result.findings)
+
+        cluster_results.append(
+            {
+                "cluster_id": resource.get("resource_id"),
+                "cluster_name": resource.get("name"),
+                "lineage": dict(evidence.lineage),
+                "collected_at": evidence.collected_at,
+                "evidence_quality": {
+                    "source_available": (
+                        evidence.quality.source_available
+                    ),
+                    "completeness": evidence.quality.completeness,
+                    "freshness": evidence.quality.freshness,
+                    "timestamp_valid": (
+                        evidence.quality.timestamp_valid
+                    ),
+                    "consistency": evidence.quality.consistency,
+                    "missing_fields": (
+                        evidence.quality.missing_fields
+                    ),
+                    "notes": evidence.quality.notes,
+                },
+                "observation_start": evidence.observation_start,
+                "observation_end": evidence.observation_end,
+                "runtime_activity_state": (
+                    cluster_result.summary["runtime_activity_state"]
+                ),
+                "rule_evaluations": (
+                    cluster_result.summary["rule_evaluations"]
+                ),
+                "findings_count": len(cluster_result.findings),
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Evidence rows that do not belong to an analyzed cluster remain visible
+    # as ignored/unmatched evidence rather than being silently fabricated into
+    # resources.
+    # ------------------------------------------------------------------
+    unmatched_rows: dict[str, int] = {}
+
+    for table_name in (
+        "cluster",
+        "node_timeline",
+        "billing_usage",
+        "job_task_run_timeline",
+    ):
         unmatched_rows[table_name] = sum(
             row.get("cluster_id") not in discovered_ids
             for row in evidence_rows.get(table_name, [])
         )
+
     evaluable_clusters = sum(
         any(
             evaluation["status"] != "NOT_EVALUABLE"
@@ -525,19 +770,38 @@ async def analyze_databricks_compute(
         )
         for cluster in cluster_results
     )
-    recommendations = persist_recommendations(db, all_findings)
+
+    recommendations = persist_recommendations(
+        db,
+        all_findings,
+    )
+
     optimization_result = {
         "status": "ANALYZED",
         "evidence_source": "databricks_sql",
         "cluster_inventory_source": cluster_inventory_source,
-        "findings": [finding.__dict__ for finding in all_findings],
+        "evidence_tables": {
+            table_name: {
+                "source": f"databricks_ws.agent.{table_name}",
+                "rows": len(evidence_rows.get(table_name, [])),
+            }
+            for table_name in evidence_tables
+        },
+        "findings": [
+            finding.__dict__
+            for finding in all_findings
+        ],
         "summary": {
             "clusters_analyzed": len(discovered_clusters),
             "clusters_evaluable": evaluable_clusters,
             "actionable_findings": len(all_findings),
-            "recommendations_created_or_updated": len(recommendations),
+            "recommendations_created_or_updated": len(
+                recommendations
+            ),
             "cluster_results": cluster_results,
-            "failed_sources": sorted(evidence_rows.get("errors", {}).keys()),
+            "failed_sources": sorted(
+                evidence_rows.get("errors", {}).keys()
+            ),
             "ignored_unmatched_evidence_rows": unmatched_rows,
             "execution_enabled": False,
             "human_approval_required": True,
@@ -546,8 +810,16 @@ async def analyze_databricks_compute(
         "recommendations": recommendations,
     }
 
+    # ------------------------------------------------------------------
     # 5. Existing analysis contract.
-    # This remains intact so the existing UI/reporting behavior does not break.
+    #
+    # DO NOT replace this with discovered_clusters or statuses=[].
+    # Existing tests and UI contracts depend on REST discovery being supplied
+    # to the established configuration analyzer.
+    #
+    # Stage 1 evidence/recommendations are carried separately in
+    # compute_optimization above.
+    # ------------------------------------------------------------------
     analysis = analyze_compute(
         workspace_name=result.data.get("workspace_name"),
         resources=resources,
@@ -562,9 +834,11 @@ async def analyze_databricks_compute(
     )
 
     logger.info(
-        "agent_databricks_analysis env_id=%s resources=%d findings=%d",
+        "agent_databricks_analysis env_id=%s resources=%d "
+        "stage1_clusters=%d findings=%d",
         environment.id,
         len(resources),
+        len(discovered_clusters),
         len(analysis.findings),
     )
 
