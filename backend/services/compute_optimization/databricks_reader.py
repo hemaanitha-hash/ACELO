@@ -217,8 +217,8 @@ class DatabricksSQLReader:
         ):
             try:
                 evidence[table_name] = await self.read_table(table_name)
-            except DatabricksSQLReaderError:
+            except DatabricksSQLReaderError as exc:
                 evidence[table_name] = []
-                errors[table_name] = "READ_FAILED"
+                errors[table_name] = str(exc)
         evidence["errors"] = errors
         return evidence
