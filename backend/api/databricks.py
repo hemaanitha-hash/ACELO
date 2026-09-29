@@ -175,7 +175,19 @@ async def list_databricks_resources(
         compute=ComputeOut(**payload["compute"]),
         resources=[AceloResourceOut(**r) for r in payload["resources"]],
         statuses=[ResourceTypeStatusOut(**s) for s in payload["statuses"]],
-        probes=[DiscoveryProbeOut(**p) for p in payload["probes"]],
+        probes=[
+    DiscoveryProbeOut(
+        **{
+            **probe,
+            "platform_error_code": (
+                str(probe["platform_error_code"])
+                if probe.get("platform_error_code") is not None
+                else None
+            ),
+        }
+    )
+    for probe in payload["probes"]
+],
     )
 
 
