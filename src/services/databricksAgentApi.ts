@@ -143,22 +143,66 @@ async function ensureMvpDatabricksContext(): Promise<void> {
  * same way the backend would; the backend remains the authority.
  */
 export function isDatabricksComputeRequest(prompt: string): boolean {
-  const lowered = (prompt || "").toLowerCase();
-  const compute = ["compute", "cluster", "clusters", "warehouse", "warehouses", "serverless", "resource", "resources"];
-  const analysis = ["analyz", "analys", "optimi", "review", "inspect", "audit", "find", "discover", "check", "look"];
-  const listing = ["show", "list", "what", "which", "any", "all", "see", "get", "tell"];
-  const mentionsCompute = compute.some((w) => lowered.includes(w));
+  const lowered = (prompt || "").trim().toLowerCase();
 
-  // Naming Databricks works from any context.
+  if (!lowered) return false;
+
+  const compute = [
+    "compute",
+    "cluster",
+    "clusters",
+    "warehouse",
+    "warehouses",
+    "serverless",
+    "resource",
+    "resources",
+  ];
+
+  const analysis = [
+    "analyz",
+    "analys",
+    "optimi",
+    "review",
+    "inspect",
+    "audit",
+    "find",
+    "discover",
+    "check",
+    "look",
+    "identify",
+  ];
+
+  const listing = [
+    "show",
+    "list",
+    "what",
+    "which",
+    "any",
+    "all",
+    "see",
+    "get",
+    "tell",
+  ];
+
+  const mentionsCompute = compute.some((w) => lowered.includes(w));
+  const asksAnalysis = analysis.some((w) => lowered.includes(w));
+  const asksListing = listing.some((w) => lowered.includes(w));
+
+  // Explicit Databricks request.
   if (lowered.includes("databricks")) {
-    return mentionsCompute && analysis.some((w) => lowered.includes(w));
+    return mentionsCompute && asksAnalysis;
   }
 
-  // With Databricks ACTIVE the platform is already known, so "show me all
-  // clusters" means Databricks clusters — the user should not have to say so.
-  // With Fabric active the same words must NOT route here.
+  // In the Databricks-only MVP, Databricks is the platform by definition.
+  // This allows routing even before the global active context is initialized.
+  if (isDatabricksOnly()) {
+    return mentionsCompute && (asksAnalysis || asksListing);
+  }
+
+  // In the legacy multi-platform experience, only route when
+  // Databricks is actually the active platform.
   if (isActive("databricks")) {
-    return mentionsCompute && [...analysis, ...listing].some((w) => lowered.includes(w));
+    return mentionsCompute && (asksAnalysis || asksListing);
   }
 
   return false;
