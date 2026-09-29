@@ -397,6 +397,17 @@ async def analyze_databricks_compute(
         evidence_rows = {table: [] for table in evidence_tables}
         evidence_rows["errors"] = {table: "READ_FAILED" for table in evidence_tables}
 
+        # ------------------------------------------------------------------
+    # Stage 1 demo cluster inventory
+    #
+    # Prefer live classic-cluster discovery when it is available.
+    # For the current demo workspace, classic-cluster listing is not
+    # permitted, so use the existing Databricks evidence table
+    # `databricks_ws.agent.cluster` as the authoritative cluster inventory.
+    #
+    # This is still real Databricks workspace data. No cluster is created,
+    # modified, started, stopped, or otherwise mutated.
+    # ------------------------------------------------------------------
     discovered_clusters = sorted(
         (
             resource
@@ -405,11 +416,64 @@ async def analyze_databricks_compute(
         ),
         key=lambda resource: str(resource.get("resource_id") or ""),
     )
+
+    cluster_inventory_source = "databricks_discovery"
+
+    if not discovered_clusters:
+        table_clusters: dict[str, dict[str, Any]] = {}
+
+        for row in evidence_rows.get("cluster", []):
+            cluster_id = row.get("cluster_id")
+
+            if cluster_id is None or str(cluster_id).strip() == "":
+                continue
+
+            cluster_id = str(cluster_id).strip()
+
+            # One evidence-table row per cluster is enough to build the
+            # Stage 1 demo inventory. Keep the first valid row so that
+            # repeated source rows do not create duplicate resources.
+            if cluster_id in table_clusters:
+                continue
+
+            cluster_name = row.get("cluster_name")
+            if cluster_name is None or str(cluster_name).strip() == "":
+                cluster_name = cluster_id
+
+            table_clusters[cluster_id] = {
+                "platform": "databricks",
+                "resource_type": "CLASSIC_CLUSTER",
+                "resource_id": cluster_id,
+                "name": str(cluster_name),
+                "state": row.get("state"),
+                "metadata": dict(row),
+            }
+
+        discovered_clusters = sorted(
+            table_clusters.values(),
+            key=lambda resource: str(resource.get("resource_id") or ""),
+        )
+
+        if discovered_clusters:
+            cluster_inventory_source = "databricks_ws.agent.cluster"
+
+            steps["discover"].detail = (
+                "Live classic-cluster listing unavailable; "
+                f"using {len(discovered_clusters)} cluster(s) from "
+                "databricks_ws.agent.cluster for Stage 1 analysis."
+            )
+
+            steps["resources"].detail = (
+                f"{len(discovered_clusters)} Stage 1 cluster(s) "
+                "from databricks_ws.agent.cluster"
+            )
+
     discovered_ids = {
         resource.get("resource_id")
         for resource in discovered_clusters
         if resource.get("resource_id")
     }
+
     collected_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     cluster_results = []
     all_findings = []
@@ -465,6 +529,7 @@ async def analyze_databricks_compute(
     optimization_result = {
         "status": "ANALYZED",
         "evidence_source": "databricks_sql",
+        "cluster_inventory_source": cluster_inventory_source,
         "findings": [finding.__dict__ for finding in all_findings],
         "summary": {
             "clusters_analyzed": len(discovered_clusters),
