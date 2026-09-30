@@ -375,7 +375,115 @@ class DatabricksAdapter(PlatformAdapter):
             self.platform_name, "discover_files", "DBFS/Volumes file discovery is Phase 9."
         )
 
-    async def _resolve_job_id(self, client: httpx.AsyncClient, domain: str) -> int:
+    # Domains ACELO can execute on Databricks. A domain outside this set is a
+    # caller mistake, not a configuration gap, so it is rejected before any
+    # workspace call is made.
+    _EXECUTABLE_DOMAINS = frozenset(_JOB_NAME_BY_DOMAIN)
+
+    # Domains whose execution resource MUST come from the Environment Resource
+    # Registry. Resolving one of these by job name would run whichever job in
+    # the workspace happens to carry that name, which is not necessarily the
+    # job ACELO was registered against.
+    _REGISTRY_ONLY_DOMAINS = frozenset({"cluster"})
+
+    def _registered_job_id(self, domain: str) -> str | None:
+        """
+        The Databricks job the Environment Resource Registry registered for this
+        domain, as "{domain}_job_id".
+
+        The service layer flattens the registry row onto the adapter's
+        auth_metadata (services/resource_registry.apply_to_adapter), so no job
+        id is hardcoded here and none is chosen by guessing.
+        """
+        value = self.auth_metadata.get(f"{domain}_job_id")
+        text = "" if value is None else str(value).strip()
+        return text or None
+
+    def _registered_job_id_as_int(self, domain: str) -> int:
+        """The registered job id, as the integer the Jobs API requires."""
+        registered = self._registered_job_id(domain)
+        if registered is None:
+            # start_analysis IS implemented - the job for this domain simply is
+            # not registered. Reporting that as an unimplemented capability sent
+            # users looking for missing code instead of missing configuration.
+            raise PlatformError(
+                ErrorCode.NOTEBOOK_NOT_CONFIGURED,
+                f"No Databricks job is registered for the '{domain}' domain in this "
+                f"environment. Register the job that runs the {domain} optimization "
+                f"notebook in Environment Setup before starting a run.",
+                log_detail=f"no {domain}_job_id in adapter metadata for workspace "
+                f"{self.auth_metadata.get('workspace_id')}",
+            )
+        try:
+            return int(registered)
+        except (TypeError, ValueError):
+            raise PlatformError(
+                ErrorCode.INVALID_CONFIGURATION,
+                f"The Databricks job registered for the '{domain}' domain is not a valid "
+                f"job ID. Correct it in Environment Setup.",
+                log_detail=f"{domain}_job_id is not an integer",
+            ) from None
+
+    def _registered_notebook_path(self, domain: str) -> str | None:
+        """
+        The workspace notebook the registry registered for this domain, as
+        "{domain}_notebook_id".
+
+        Same source as the job id: services/resource_registry.apply_to_adapter
+        flattens the domain's row onto auth_metadata. No path is hardcoded here.
+        """
+        value = self.auth_metadata.get(f"{domain}_notebook_id")
+        text = "" if value is None else str(value).strip()
+        return text or None
+
+    def _registered_existing_cluster_id(self, domain: str) -> str | None:
+        """
+        An existing all-purpose cluster to run a submitted notebook on, when the
+        registry names one. Absent, the task carries no compute block and the
+        workspace runs it on serverless jobs compute - so ACELO never invents a
+        cluster id or a node type.
+        """
+        value = self.auth_metadata.get(f"{domain}_existing_cluster_id")
+        text = "" if value is None else str(value).strip()
+        return text or None
+
+    async def _resolve_execution_target(
+        self, client: httpx.AsyncClient, domain: str
+    ) -> tuple[str, Any, str]:
+        """
+        What to run for this domain: ("job", job_id, source) or
+        ("notebook", path, source).
+
+        Precedence, highest first:
+          1. a registered job id      -> Jobs API run-now
+          2. a registered notebook    -> Jobs API runs/submit (one-shot run)
+          3. legacy resolution by job NAME, for domains that have no
+             registry-backed execution resource yet
+
+        A domain in _REGISTRY_ONLY_DOMAINS never reaches step 3: it fails with a
+        configuration error rather than running an unrelated job. This is what
+        lets a freshly installed App run the registered notebook without an
+        administrator first creating a Job by hand.
+        """
+        # A job id that is present but malformed is an error, never a reason to
+        # silently fall through to the notebook.
+        if self._registered_job_id(domain):
+            return "job", self._registered_job_id_as_int(domain), "registry"
+
+        notebook_path = self._registered_notebook_path(domain)
+        if notebook_path:
+            return "notebook", notebook_path, "registry"
+
+        if domain in self._REGISTRY_ONLY_DOMAINS:
+            raise PlatformError(
+                ErrorCode.NOTEBOOK_NOT_CONFIGURED,
+                f"No Databricks job or notebook is registered for the '{domain}' domain "
+                f"in this environment. Register the {domain} optimization notebook (or a "
+                f"job that runs it) in Environment Setup before starting a run.",
+                log_detail=f"neither {domain}_job_id nor {domain}_notebook_id in adapter "
+                f"metadata for workspace {self.auth_metadata.get('workspace_id')}",
+            )
+
         job_name = _JOB_NAME_BY_DOMAIN.get(domain)
         if not job_name:
             raise ValueError(f"No Databricks job mapping for domain '{domain}'.")
@@ -386,26 +494,95 @@ class DatabricksAdapter(PlatformAdapter):
         for job in jobs:
             settings = job.get("settings", {})
             if settings.get("name") == job_name:
-                return job["job_id"]
+                return "job", job["job_id"], "name"
 
         raise LookupError(
             f"No Databricks job named '{job_name}' was found in this workspace. "
             f"The '{domain}' optimization requires a job with that exact name to already exist."
         )
 
+    def _submit_body(self, domain: str, notebook_path: str) -> dict[str, Any]:
+        """
+        The runs/submit payload for a one-shot notebook run.
+
+        Compute: an existing cluster when the registry names one, otherwise no
+        compute block at all, which runs the task on the workspace's serverless
+        jobs compute. Either way no cluster id, node type or runtime version is
+        invented here.
+        """
+        task: dict[str, Any] = {
+            "task_key": f"acelo_{domain}_optimization",
+            "notebook_task": {"notebook_path": notebook_path},
+        }
+        existing_cluster_id = self._registered_existing_cluster_id(domain)
+        if existing_cluster_id:
+            task["existing_cluster_id"] = existing_cluster_id
+        return {
+            "run_name": f"ACELO {domain} optimization",
+            "tasks": [task],
+        }
+
     async def start_analysis(
         self, domain: str, parameters: dict[str, Any] | None = None
     ) -> StartAnalysisResult:
-        async with httpx.AsyncClient(timeout=30) as client:
-            job_id = await self._resolve_job_id(client, domain)
-            resp = await client.post(
-                f"{self.endpoint}/api/2.1/jobs/run-now",
-                headers=self._headers(),
-                json={"job_id": job_id},
+        """
+        Starts this domain's analysis on Databricks and returns the platform's
+        own run id.
+
+        A registered JOB runs through run-now. A registered NOTEBOOK with no job
+        runs through runs/submit as a one-shot run - the same Jobs API, so the
+        run id it returns is monitored by the existing runs/get polling with no
+        second execution framework and no Job object to create first.
+
+        Parameters: the registered notebook's configuration is fixed in the
+        notebook itself - it declares no dbutils widgets, so it can consume no
+        run-now or runs/submit parameter. Sending notebook_params it cannot read
+        would assert a contract that does not exist, so ACELO's runtime
+        parameters are recorded on the result for diagnosis and withheld from
+        the payload.
+        """
+        if domain not in self._EXECUTABLE_DOMAINS:
+            raise PlatformError(
+                ErrorCode.UNSUPPORTED,
+                f"ACELO does not run a '{domain}' analysis on Databricks.",
+                log_detail=f"unknown domain '{domain}' for databricks start_analysis",
             )
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            kind, target, target_source = await self._resolve_execution_target(client, domain)
+            if kind == "notebook":
+                path = f"{self.endpoint}/api/2.1/jobs/runs/submit"
+                body = self._submit_body(domain, target)
+            else:
+                path = f"{self.endpoint}/api/2.1/jobs/run-now"
+                body = {"job_id": target}
+            resp = await client.post(path, headers=self._headers(), json=body)
         resp.raise_for_status()
+        # The run id is Databricks' own. A run is reported as started only
+        # because the platform issued one - it is never generated here.
         run_id = resp.json()["run_id"]
-        return StartAnalysisResult(platform_run_id=str(run_id), status="STARTING", detail={"job_id": job_id})
+        logger.info(
+            "databricks_run_started domain=%s execution_kind=%s target=%s source=%s run_id=%s",
+            domain, kind, target, target_source, run_id,
+        )
+        detail: dict[str, Any] = {
+            "execution_kind": kind,
+            "job_source": target_source,
+            # Built by the registry, deliberately not sent: see the note above.
+            "parameters_withheld": sorted(parameters or {}),
+        }
+        if kind == "notebook":
+            # job_service records detail["item_id"] as the resource that ran, so
+            # a submitted run still names the notebook it executed.
+            detail["notebook_path"] = target
+            detail["item_id"] = target
+        else:
+            detail["job_id"] = target
+        return StartAnalysisResult(
+            platform_run_id=str(run_id),
+            status="STARTING",
+            detail=detail,
+        )
 
     async def get_run_status(self, platform_run_id: str, domain: str = "cluster") -> RunStatusResult:
         async with httpx.AsyncClient(timeout=15) as client:

@@ -11,18 +11,35 @@ The ACELO Optimization Agent's Databricks compute analysis flow.
      -> recommendations
 
 Separate from `agent/orchestrator.py` on purpose: that path starts a platform
-JOB and hands it to the background execution worker. This one runs no job,
-touches no worker, and finishes inside the request — it only reads.
+JOB and hands it to the background execution worker. This one finishes inside
+the request and never touches the worker.
+
+Cluster optimization has two sources, chosen by configuration, never guessed:
+
+  * When the Environment Resource Registry has a cluster execution target
+    (a registered job, or a notebook such as ACELO_CLUSTER_NOTEBOOK_ID), the
+    Cluster Optimization NOTEBOOK is the source of truth. The agent starts it
+    through the existing job_service / DatabricksAdapter path, waits for the
+    real Databricks run to finish, reads the notebook's result tables and turns
+    them into recommendations through the existing contract. No optimization
+    logic is re-implemented here.
+  * With no target registered, the earlier read-only evidence analysis runs
+    unchanged.
+
+Neither source changes a cluster: the notebook's own executor stays disabled
+(ALLOW_API_ACTIONS = False) and every recommendation still needs approval.
 
 Steps are recorded as they ACTUALLY complete. A step is never marked done in
 advance, and when one fails the remaining steps stay pending, so the UI cannot
 show progress that did not happen.
 """
 
+import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from sqlalchemy.orm import Session
@@ -30,9 +47,17 @@ from sqlalchemy.orm import Session
 from agent.capabilities import CapabilityStatus, discover_databricks_resources
 from agent.databricks_analysis import analyze_compute
 from agent.databricks_report import render_markdown
-from models import Environment
+from models import Connection, Environment, JobStatus
 
+from services import job_service, resource_registry
 from services.compute_optimization.databricks_reader import DatabricksSQLReader
+from services.compute_optimization.notebook_results import adapt_notebook_results
+from services.execution_worker import (
+    POLL_BACKOFF_FACTOR,
+    POLL_INITIAL_INTERVAL,
+    POLL_MAX_INTERVAL,
+    POLL_TIMEOUT_SECONDS,
+)
 from services.compute_optimization.engine import (
     IDLE_CPU,
     IDLE_MEMORY,
@@ -479,6 +504,354 @@ def _compute_evidence_for_cluster(
     )
 
 
+# ---------------------------------------------------------------------------
+# Cluster Optimization notebook execution
+# ---------------------------------------------------------------------------
+
+# The tables the Cluster Optimization notebook writes. They are the notebook's
+# own output contract - fixed in its source, not a notebook parameter (it
+# declares no widgets) - so they are named here exactly as the notebook names
+# them rather than read from configuration the notebook cannot receive.
+NOTEBOOK_FINDINGS_TABLE = "default.compute_agent_findings"
+NOTEBOOK_ACTION_QUEUE_TABLE = "default.compute_agent_action_queue"
+
+# Recorded on the AnalysisJob. The agent receives no prompt text, so this names
+# the request rather than pretending to quote the user.
+_NOTEBOOK_REQUEST = "Cluster optimization requested from the ACELO agent"
+
+# Tolerance for clock difference between this process and Databricks when
+# deciding whether a result row was written by THIS run. The notebook stamps
+# every findings row at write time, minutes after the run starts, so a small
+# allowance cannot admit the rows of a run that finished before this one began.
+_RESULT_CLOCK_SKEW = timedelta(seconds=60)
+
+# Indirection so tests drive polling without real sleeps.
+_sleep = asyncio.sleep
+
+
+def _run_timeout_seconds() -> int:
+    """
+    How long an agent request waits for the notebook run.
+
+    The agent answers inside one HTTP request, so it cannot wait the background
+    worker's full hour. Configurable, and never longer than the worker's own cap.
+    """
+    raw = (os.getenv("ACELO_AGENT_RUN_TIMEOUT_SECONDS") or "").strip()
+    try:
+        configured = int(raw) if raw else 900
+    except ValueError:
+        configured = 900
+    return max(0, min(configured, POLL_TIMEOUT_SECONDS))
+
+
+def _registered_cluster_target(db: Session, environment: Environment) -> dict[str, str] | None:
+    """
+    The cluster execution target the Environment Resource Registry resolves for
+    this environment, or None.
+
+    Read through resource_registry.get() - the same effective configuration
+    apply_to_adapter() hands the DatabricksAdapter - so the agent and the adapter
+    can never disagree about whether a target exists. A notebook path arrives
+    from ACELO_CLUSTER_NOTEBOOK_ID through the registry's configuration defaults;
+    nothing is hardcoded here.
+    """
+    config = resource_registry.get(db, environment, "cluster")
+    target = {
+        key: str(config.get(key)).strip()
+        for key in ("job_id", "notebook_id")
+        if config.get(key) and str(config.get(key)).strip()
+    }
+    return target or None
+
+
+async def _await_terminal_status(
+    db: Session,
+    connection: Connection,
+    job_run: Any,
+    access_token: str | None,
+) -> bool:
+    """
+    Polls the run through the existing job_service.sync_run_status until it
+    reaches a terminal state. Returns False on timeout.
+
+    Polling happens inside this request on purpose: a Databricks App connection
+    stores no secret, so the background worker would decline to poll it.
+    Backoff reuses the worker's own intervals.
+    """
+    deadline = time.monotonic() + _run_timeout_seconds()
+    interval = POLL_INITIAL_INTERVAL
+
+    while job_run.status not in job_service.TERMINAL_STATUSES:
+        if time.monotonic() >= deadline:
+            return False
+        await _sleep(interval)
+        await job_service.sync_run_status(db, connection, job_run, access_token)
+        interval = min(interval * POLL_BACKOFF_FACTOR, POLL_MAX_INTERVAL)
+
+    return True
+
+
+def _parse_generated_at(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _rows_not_from_this_run(
+    rows: list[dict[str, Any]],
+    run_started_at: datetime | None,
+) -> list[dict[str, Any]]:
+    """
+    Result rows that cannot be attributed to the run that just finished.
+
+    The notebook overwrites the findings table on every run and stamps each row
+    with generated_at at write time; it records no run id. So a row is this
+    run's only if it was written after the run started. A row with no readable
+    timestamp - or a run with no recorded start - cannot be attributed at all.
+    """
+    if run_started_at is None:
+        return list(rows)
+    started = (
+        run_started_at if run_started_at.tzinfo else run_started_at.replace(tzinfo=timezone.utc)
+    )
+    threshold = started - _RESULT_CLOCK_SKEW
+    stale = []
+    for row in rows:
+        generated_at = _parse_generated_at(row.get("generated_at"))
+        if generated_at is None or generated_at < threshold:
+            stale.append(row)
+    return stale
+
+
+async def _analyze_with_notebook(
+    *,
+    db: Session,
+    environment: Environment,
+    access_token: str | None,
+    llm: Callable[[str], str] | None,
+    steps: dict[str, Step],
+    order: list[Step],
+    discovery: dict[str, Any],
+    target: dict[str, str],
+) -> AgentAnalysisResult:
+    """
+    Cluster optimization from the Cluster Optimization notebook.
+
+        start the registered job/notebook (existing job_service + adapter)
+        -> real Databricks run_id
+        -> wait for a terminal state (existing job_service.sync_run_status)
+        -> read the notebook's result tables (existing DatabricksSQLReader)
+        -> adapt_notebook_results()
+        -> persist_recommendations()
+
+    Any failure returns a structured error naming the run, and creates no
+    recommendation: a failed, timed-out or unattributable run never yields
+    results, and the earlier Python analysis is never substituted for it.
+    """
+    resources = discovery.get("resources", [])
+    statuses = discovery.get("statuses", [])
+    workspace_name = discovery.get("workspace_name")
+
+    def failed(status: str, message: str, job_run: Any = None) -> AgentAnalysisResult:
+        steps["analyze"].status = StepStatus.FAILED
+        steps["analyze"].detail = message
+        logger.warning(
+            "agent_notebook_run_failed env_id=%s status=%s acelo_run_id=%s platform_run_id=%s",
+            environment.id,
+            status,
+            getattr(job_run, "id", None),
+            getattr(job_run, "platform_run_id", None),
+        )
+        return AgentAnalysisResult(
+            ok=False,
+            status=status,
+            steps=order,
+            message=message,
+            environment_id=environment.id,
+        )
+
+    connection = (
+        db.query(Connection).filter(Connection.id == environment.connection_id).first()
+    )
+    if connection is None:
+        return failed(
+            "NOTEBOOK_RUN_NOT_STARTED",
+            "This Databricks environment has no connection to run the Cluster "
+            "Optimization notebook through.",
+        )
+
+    # 1-3. Start the run through the existing execution path. The adapter
+    # resolves the registered job or notebook itself and returns Databricks'
+    # own run id; start_job_run records it on the JobRun.
+    analysis_job = job_service.create_analysis_job(
+        db, environment.customer_id, connection, request=_NOTEBOOK_REQUEST, intent="cluster"
+    )
+    job_run = job_service.create_job_run(db, analysis_job, "cluster")
+    await job_service.start_job_run(db, connection, job_run, access_token)
+
+    if not job_run.platform_run_id:
+        return failed(
+            "NOTEBOOK_RUN_NOT_STARTED",
+            "The Cluster Optimization notebook could not be started: "
+            f"{job_run.error or 'Databricks issued no run id.'}",
+            job_run,
+        )
+
+    run_id = job_run.platform_run_id
+    logger.info(
+        "agent_notebook_run_started env_id=%s acelo_run_id=%s platform_run_id=%s target=%s",
+        environment.id,
+        job_run.id,
+        run_id,
+        sorted(target),
+    )
+
+    # 4. Wait for the real run to finish.
+    if not await _await_terminal_status(db, connection, job_run, access_token):
+        return failed(
+            "NOTEBOOK_RUN_TIMEOUT",
+            f"Databricks run {run_id} did not finish within "
+            f"{_run_timeout_seconds()} seconds. It may still be running; no "
+            "recommendations were created from it.",
+            job_run,
+        )
+
+    # 5. A run that did not succeed produces nothing - its tables may still
+    # hold an earlier run's rows, which must never be read as this run's.
+    if job_run.status != JobStatus.COMPLETED.value:
+        return failed(
+            "NOTEBOOK_RUN_FAILED",
+            f"Databricks run {run_id} ended {job_run.status}"
+            + (f": {job_run.error}" if job_run.error else ".")
+            + " No recommendations were created.",
+            job_run,
+        )
+
+    # 6. Read the notebook's result tables with the existing SELECT-only reader.
+    reader = DatabricksSQLReader(
+        warehouse_id=_resolve_sql_warehouse_id(resources),
+        access_token=access_token,
+    )
+    try:
+        finding_rows = await reader.execute(f"SELECT * FROM {NOTEBOOK_FINDINGS_TABLE}")
+    except Exception as exc:  # noqa: BLE001 - reader and transport faults alike are reported, never masked
+        return failed(
+            "NOTEBOOK_RESULTS_UNAVAILABLE",
+            f"Databricks run {run_id} completed, but {NOTEBOOK_FINDINGS_TABLE} "
+            f"could not be read: {str(exc)[:300]}",
+            job_run,
+        )
+
+    # The action queue only enriches findings; the notebook writes it only when
+    # it has actions. Its absence is recorded, not fatal.
+    action_queue_error = None
+    try:
+        action_rows = await reader.execute(f"SELECT * FROM {NOTEBOOK_ACTION_QUEUE_TABLE}")
+    except Exception as exc:  # noqa: BLE001 - optional enrichment
+        action_rows = []
+        action_queue_error = str(exc)[:300]
+
+    # Stale-result protection: every findings row must have been written by
+    # THIS run. If any predates it, the table does not reflect this run alone.
+    stale = _rows_not_from_this_run(finding_rows, job_run.started_at)
+    if stale:
+        return failed(
+            "NOTEBOOK_RESULTS_STALE",
+            f"Databricks run {run_id} completed, but {len(stale)} of "
+            f"{len(finding_rows)} row(s) in {NOTEBOOK_FINDINGS_TABLE} were not "
+            "written by this run, so they cannot be attributed to it. No "
+            "recommendations were created.",
+            job_run,
+        )
+
+    # 7. Notebook rows -> the existing finding contract.
+    adaptation = adapt_notebook_results(
+        finding_rows,
+        action_rows,
+        customer_id=environment.customer_id,
+        environment_id=environment.id,
+        workspace_name=workspace_name,
+    )
+
+    # 8. The existing persistence - the same records the approval flow uses.
+    recommendations = persist_recommendations(db, adaptation.findings)
+
+    # The configuration analysis of discovered resources is unchanged; it feeds
+    # classification, opportunities and the report exactly as before.
+    analysis = analyze_compute(
+        workspace_name=workspace_name,
+        resources=resources,
+        statuses=statuses,
+        llm=llm,
+    )
+
+    optimization_result = {
+        "status": "ANALYZED",
+        "evidence_source": "cluster_optimization_notebook",
+        "execution": {
+            "acelo_run_id": job_run.id,
+            "platform_run_id": run_id,
+            "platform_resource_id": job_run.platform_resource_id,
+            "status": job_run.status,
+        },
+        "result_tables": {
+            NOTEBOOK_FINDINGS_TABLE: {"rows": len(finding_rows)},
+            NOTEBOOK_ACTION_QUEUE_TABLE: {
+                "rows": len(action_rows),
+                "error": action_queue_error,
+            },
+        },
+        "findings": adaptation.findings,
+        "summary": {
+            "clusters_analyzed": len({f["resource_id"] for f in adaptation.findings}),
+            "actionable_findings": len(adaptation.findings),
+            "recommendations_created_or_updated": len(recommendations),
+            "rejected_notebook_rows": adaptation.reasons(),
+            "execution_enabled": False,
+            "human_approval_required": True,
+            "savings_status": "NOT_ESTIMATED",
+        },
+        "recommendations": recommendations,
+    }
+
+    steps["analyze"].status = StepStatus.DONE
+    steps["analyze"].detail = (
+        f"Databricks run {run_id}: {len(recommendations)} recommendation"
+        f"{'' if len(recommendations) == 1 else 's'} from the Cluster "
+        "Optimization notebook"
+    )
+
+    logger.info(
+        "agent_notebook_analysis env_id=%s platform_run_id=%s rows=%d findings=%d "
+        "recommendations=%d rejected=%s",
+        environment.id,
+        run_id,
+        len(finding_rows),
+        len(adaptation.findings),
+        len(recommendations),
+        adaptation.reasons(),
+    )
+
+    return AgentAnalysisResult(
+        ok=True,
+        status=CapabilityStatus.OK,
+        steps=order,
+        environment_id=environment.id,
+        analysis={
+            **analysis.to_dict(),
+            "compute_optimization": optimization_result,
+        },
+        markdown=render_markdown(analysis),
+    )
+
+
 async def analyze_databricks_compute(
     db: Session,
     environment: Environment,
@@ -487,7 +860,12 @@ async def analyze_databricks_compute(
 ) -> AgentAnalysisResult:
     """
     Runs the full discover -> analyze -> recommend flow against the given ACELO
-    environment. Read-only: it creates nothing and executes nothing.
+    environment.
+
+    With a registered cluster execution target, cluster optimization comes
+    from the Cluster Optimization notebook run through the existing execution
+    path (see _analyze_with_notebook). Without one, the read-only evidence
+    analysis runs as before. Neither changes a Databricks resource.
 
     The environment argument is what determines the Databricks workspace —
     no workspace URL, workspace id, customer, cluster or warehouse is hardcoded
@@ -545,6 +923,27 @@ async def analyze_databricks_compute(
 
     steps["resources"].status = StepStatus.DONE
     steps["resources"].detail = f"{len(resources)} resource(s)"
+
+    # ------------------------------------------------------------------
+    # Cluster optimization from the notebook, when one is registered.
+    #
+    # The registry decides, not this code: a registered job or notebook makes
+    # the Cluster Optimization notebook the source of truth. Once a target is
+    # registered, a failed run is reported as failed - the evidence analysis
+    # below is never substituted for it.
+    # ------------------------------------------------------------------
+    cluster_target = _registered_cluster_target(db, environment)
+    if cluster_target is not None:
+        return await _analyze_with_notebook(
+            db=db,
+            environment=environment,
+            access_token=access_token,
+            llm=llm,
+            steps=steps,
+            order=order,
+            discovery=result.data,
+            target=cluster_target,
+        )
 
     # ------------------------------------------------------------------
     # Read compute evidence through Databricks SQL.

@@ -47,8 +47,18 @@ COLUMN_KEYS = (
 EXTRA_KEYS = (
     "column_mapping", "fabric_environment_id", "model_dir", "llm_key_vault_uri", "llm_secret_name",
     "llm_model_name", "validation_batch_size", "lakehouse_database",
+    # Databricks execution resource. A Databricks workspace runs a NOTEBOOK through
+    # a JOB, so the domain's registered execution resource is a job id (the notebook
+    # itself stays in notebook_id). Held in settings_json rather than its own column:
+    # the registry already carries non-secret identifiers there, so representing a
+    # Databricks job needs no schema change.
+    "job_id",
 )
 KEYS = COLUMN_KEYS + EXTRA_KEYS
+
+# How a domain's execution resource is run. "notebook" and "pipeline" are the
+# established Fabric values; "job" is the Databricks one (jobs/run-now).
+EXECUTION_TYPES = ("notebook", "pipeline", "job")
 
 # Runtime notebook parameters a domain's notebook receives (from its own row only).
 RUNTIME_PARAMETER_KEYS = (
@@ -247,7 +257,15 @@ def get(db: Session, environment: Environment | str, domain: str) -> dict[str, A
     values["pipeline_source"] = "configured" if values["pipeline_id"] else ("acelo-managed" if provisioned_pipeline else None)
     values["notebook_id"] = values["notebook_id"] or provisioned_notebook
     values["pipeline_id"] = values["pipeline_id"] or provisioned_pipeline
-    if not values["notebook_id"] and not values["pipeline_id"]:
+    # A Databricks job is registered, never guessed: the id comes from the
+    # administrator's mapping or from deployment configuration. When it names a
+    # job this environment's discovery actually reported, that is recorded too -
+    # so an id pointing at nothing is visible rather than silently trusted.
+    values["job_source"] = "configured" if values.get("job_id") else None
+    values["job_name"] = _discovered_job_name(db, env, values.get("job_id"))
+    if values.get("job_id") and values["job_name"]:
+        values["job_source"] = "discovered"
+    if not values["notebook_id"] and not values["pipeline_id"] and not values.get("job_id"):
         # A domain ACELO did not deploy (e.g. Storage): an ACELO-named resource
         # already in the workspace is selected automatically.
         found = _discovered_resource(db, env, domain)
@@ -257,10 +275,15 @@ def get(db: Session, environment: Environment | str, domain: str) -> dict[str, A
             values[f"{kind}_source"] = "discovered"
             values["execution_type"] = values.get("execution_type") or kind
     if not values.get("execution_type"):
-        # Default execution resource: Query runs through its ACELO pipeline when
-        # one is deployed; Cluster keeps its established default (notebook) unless mapped.
-        values["execution_type"] = "pipeline" if (domain != "cluster" and values["pipeline_id"]) else "notebook"
-    values["execution_type"] = "pipeline" if values.get("execution_type") == "pipeline" else "notebook"
+        # Default execution resource: on Databricks a registered job is what runs;
+        # Query runs through its ACELO pipeline when one is deployed; Cluster keeps
+        # its established default (notebook) unless mapped.
+        if env.platform == "databricks" and values.get("job_id"):
+            values["execution_type"] = "job"
+        else:
+            values["execution_type"] = "pipeline" if (domain != "cluster" and values["pipeline_id"]) else "notebook"
+    if values.get("execution_type") not in EXECUTION_TYPES:
+        values["execution_type"] = "notebook"
     values["workspace_id"] = values["workspace_id"] or env.workspace_id
     values["domain"] = domain
     values["environment_id"] = env.id
@@ -274,6 +297,27 @@ _DISCOVERY_NAMES = {
     "query": (("pipeline", "DataPipeline", "ACELO_Query_Optimization_Pipeline"),),
     "cluster": (("pipeline", "DataPipeline", "ACELO_Cluster_Optimization_Pipeline"),),
 }
+
+
+def _discovered_job_name(db: Session, environment: Environment, job_id: str | None) -> str | None:
+    """
+    The display name of the discovered Databricks Job with THIS id, or None.
+
+    Lookup is by id, never by name: the registry confirms that a registered job
+    exists in the environment's last discovery, and never selects one for the
+    administrator.
+    """
+    if not job_id or environment.platform != "databricks":
+        return None
+    from models import Resource
+
+    match = (
+        db.query(Resource)
+        .filter(Resource.environment_id == environment.id, Resource.resource_type == "Job",
+                Resource.platform_resource_id == str(job_id))
+        .first()
+    )
+    return match.display_name if match else None
 
 
 def _discovered_resource(db: Session, environment: Environment, domain: str) -> tuple[str, str] | None:
@@ -404,11 +448,11 @@ def summary(db: Session, environment: Environment) -> list[dict[str, Any]]:
     result = []
     for domain in DOMAINS:
         cfg = get(db, environment, domain)
-        is_pipeline = cfg["execution_type"] == "pipeline"
-        item_id = cfg["pipeline_id"] if is_pipeline else cfg["notebook_id"]
+        kind = cfg["execution_type"] if cfg["execution_type"] in EXECUTION_TYPES else "notebook"
+        item_id = cfg[f"{kind}_id"]
         missing = job_service.missing_required_configuration(domain, build_runtime_parameters(db, environment, domain, "-"))
         if not item_id:
-            missing.append("pipeline" if is_pipeline else "notebook")
+            missing.append(kind)
         from services import provisioning_service
 
         if environment.platform == "fabric" and provisioning_service.default_lakehouse(db, environment, domain) is None:
@@ -419,8 +463,8 @@ def summary(db: Session, environment: Environment) -> list[dict[str, Any]]:
             "missing": missing,
             "execution_type": cfg["execution_type"],
             "resource": (
-                {"type": "pipeline" if is_pipeline else "notebook", "id": item_id,
-                 "name": names.get(item_id), "source": cfg["pipeline_source" if is_pipeline else "notebook_source"]}
+                {"type": kind, "id": item_id,
+                 "name": names.get(item_id), "source": cfg[f"{kind}_source"]}
                 if item_id else None
             ),
             "settings": {k: cfg.get(k) for k in KEYS},
