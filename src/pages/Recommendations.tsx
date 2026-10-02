@@ -1,52 +1,57 @@
-import React, { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { CheckCircle2, Clock3, Send, Sparkles } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { ArrowRight, Send, Sparkles } from "lucide-react";
 import Layout from "../components/Layout";
 import PageHeader from "../components/PageHeader";
 import Button from "../components/Button";
-import StateBlock, { StatePanel } from "../components/StateBlock";
+import { StatePanel } from "../components/StateBlock";
 import OpportunityTable from "../components/OpportunityTable";
-import StatusBadge from "../components/StatusBadge";
+import { AnalysisFailure } from "../components/AnalysisStatus";
+import {
+  EmptyState,
+  ErrorState,
+  KeyValueGrid,
+  LifecyclePill,
+  LoadingState,
+  Notice,
+  StatusPill,
+  WorkflowIndicator,
+  formatDateTime,
+  severityTone,
+  titleCase,
+} from "../components/ui";
 import { getOptimizations } from "../services/api";
 import type { Opportunity } from "../types";
 import { isDatabricksOnly } from "../services/experience";
+import type { AgentOpportunity, Stage1Recommendation } from "../services/databricksAgentApi";
 import {
-  AgentApiError,
-  type AgentOpportunity,
-  type Stage1Recommendation as ApiStage1Recommendation,
-} from "../services/databricksAgentApi";
-import {
-  ensureComputeAnalysis,
   getComputeAnalysis,
   subscribeComputeAnalysis,
   type ComputeAnalysisState,
 } from "../services/computeAnalysis";
+import {
+  LIFECYCLE_LABELS,
+  RequestError,
+  lifecycleOf,
+  parseMaybeJson,
+  requestApproval,
+  type Lifecycle,
+  type PersistedRecommendation,
+  type RecommendationView,
+} from "../services/stage1Api";
+import { useRecommendationLifecycle } from "../hooks/useRecommendationLifecycle";
 
 /**
- * Recommendations — the end of the MVP journey.
+ * Recommendations — persisted, evidence-backed recommendations and where each
+ * one is in the ACELO lifecycle:
  *
- *   AI Agent / Compute Optimization
- *     -> analyzeDatabricksCompute()   (the ONE analysis engine)
- *       -> DatabricksAgentResult
- *         -> computeAnalysis store
- *           -> this page
+ *   Open -> Send for Approval -> Pending Approval -> Approved (Ready to Execute)
  *
- * Stage 1 approval flow ends at:
- *
- *   Recommendation
- *     -> Send to Approval
- *     -> Pending Approval
- *
- * Approval does NOT execute or mutate Databricks.
- *
- * It previously rendered legacy `getOptimizations()` data, which had nothing to
- * do with the Databricks analysis the user had just run. It now reads the SAME
- * result, so a finding shown on Compute Optimization is the finding shown here.
- *
- * Every field comes from the backend. There is no cost, saving, utilization,
- * confidence or score anywhere, because the backend measures none of those —
- * discovery reads configuration, not consumption. Each item is therefore a
- * POTENTIAL opportunity, and states what must be observed before anyone acts.
+ * Opening this page never starts an analysis. Recommendations come from the
+ * backend (GET /api/optimizations, kind "stage1") and their state from the
+ * persisted approval records, so a browser refresh shows exactly what the
+ * backend holds. After "Send to Approval" the page reloads that state rather
+ * than editing it locally.
  */
 
 const TYPE_LABELS: Record<string, string> = {
@@ -55,626 +60,459 @@ const TYPE_LABELS: Record<string, string> = {
   SQL_WAREHOUSE: "SQL warehouse",
 };
 
-type ApprovalUiState = "OPEN" | "PENDING" | "APPROVED" | "REJECTED";
+type Filter = "ALL" | Lifecycle;
 
-type Stage1Recommendation = ApiStage1Recommendation & {
-  // The persisted recommendation contract uses `resource_name` in some
-  // versions and `resource` in others. Keep this optional so the frontend
-  // remains compatible with the existing API type without inventing data.
-  resource?: string;
-};
-
-type AgentAnalysisWithStage1 =
-  NonNullable<
-    NonNullable<ComputeAnalysisState["result"]>["analysis"]
-  > & {
-    compute_optimization?: {
-      recommendations?: Stage1Recommendation[];
-    };
-  };
-
-function formatValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value == null) return "Not available.";
-
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function getProposedState(value: unknown): {
-  direction: string;
-  reason: string;
-} {
-  if (value && typeof value === "object") {
-    const state = value as { direction?: unknown; reason?: unknown };
-    return {
-      direction: formatValue(state.direction),
-      reason: formatValue(state.reason),
-    };
-  }
-
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value) as { direction?: unknown; reason?: unknown };
-      return {
-        direction: formatValue(parsed.direction),
-        reason: formatValue(parsed.reason),
-      };
-    } catch {
-      return {
-        direction: value,
-        reason: "Not available.",
-      };
-    }
-  }
-
-  return {
-    direction: "Not available.",
-    reason: "Not available.",
-  };
-}
-
-async function requestStage1Approval(recommendationId: string): Promise<void> {
-  const response = await fetch(
-    `/api/approvals/recommendations/${encodeURIComponent(recommendationId)}/request`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    }
-  );
-
-  if (!response.ok) {
-    let detail = `Request failed (HTTP ${response.status}).`;
-
-    try {
-      const body = (await response.json()) as {
-        detail?: string;
-        message?: string;
-      };
-
-      detail = body.detail ?? body.message ?? detail;
-    } catch {
-      // Keep the HTTP error when the backend does not return JSON.
-    }
-
-    throw new Error(detail);
-  }
-}
+const FILTERS: Filter[] = ["ALL", "OPEN", "PENDING", "READY_TO_EXECUTE", "REJECTED"];
 
 export default function Recommendations() {
   if (!isDatabricksOnly()) return <LegacyRecommendations />;
   return <DatabricksRecommendations />;
 }
 
-// --- Databricks MVP ---------------------------------------------------------
+// --- Databricks -------------------------------------------------------------
+
+/**
+ * A recommendation the current session's analysis produced. It is persisted by
+ * the backend in the same request, so normally the persisted list already has
+ * it; this only covers the moment before that list is reloaded.
+ */
+function fromSession(rec: Stage1Recommendation): PersistedRecommendation {
+  return {
+    id: rec.recommendation_id,
+    recommendation_id: rec.recommendation_id,
+    kind: "stage1",
+    resource: rec.resource_name,
+    resource_id: rec.resource_id,
+    domain: "cluster",
+    stage1_domain: rec.domain,
+    environment_id: rec.environment_id,
+    title: rec.title,
+    description: rec.summary,
+    optimization_label: rec.finding_type,
+    finding_id: rec.finding_id,
+    rule_id: rec.rule_id,
+    severity: rec.severity,
+    confidence: rec.confidence,
+    risk: rec.risk,
+    created_at: rec.created_at,
+    updated_at: rec.updated_at,
+    details: { ...(rec as unknown as Record<string, unknown>), resource_name: rec.resource_name },
+  };
+}
 
 function DatabricksRecommendations() {
   const navigate = useNavigate();
-  const [state, setState] = useState<ComputeAnalysisState>(getComputeAnalysis());
-  const [loading, setLoading] = useState(!getComputeAnalysis().result);
-  const [error, setError] = useState<string | null>(null);
+  const [params, setParams] = useSearchParams();
+  const lifecycle = useRecommendationLifecycle();
+  const [analysis, setAnalysis] = useState<ComputeAnalysisState>(getComputeAnalysis());
+  const [sending, setSending] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ tone: "success" | "danger"; text: string; technical?: string | null } | null>(null);
+  const highlight = params.get("highlight");
+  const filterParam = (params.get("filter") ?? "ALL").toUpperCase() as Filter;
+  const filter: Filter = FILTERS.includes(filterParam) ? filterParam : "ALL";
 
-  // UI-only approval state for this page.
-  const [approvalStates, setApprovalStates] = useState<Record<string, ApprovalUiState>>({});
-  const [requestingApproval, setRequestingApproval] = useState<Record<string, boolean>>({});
-  const [approvalErrors, setApprovalErrors] = useState<Record<string, string | null>>({});
+  useEffect(() => subscribeComputeAnalysis(setAnalysis), []);
 
-  // Follow the store, so arriving here after a fresh analysis shows it.
-  useEffect(() => subscribeComputeAnalysis(setState), []);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-
-    try {
-      // Uses the stored result when the journey already produced one, and
-      // otherwise runs the same analysis — never a second engine.
-      await ensureComputeAnalysis();
-      setState(getComputeAnalysis());
-    } catch (e: unknown) {
-      setError(
-        e instanceof AgentApiError
-          ? e.message
-          : "The analysis could not be completed."
-      );
-    } finally {
-      setLoading(false);
-    }
-  }
-
+  // A finished analysis persisted new recommendations: show them.
+  const lastAnalyzed = analysis.analyzedAt?.getTime();
+  const firstRender = useRef(true);
   useEffect(() => {
-    if (!getComputeAnalysis().result) void load();
-    else setLoading(false);
-
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    if (lastAnalyzed) void lifecycle.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [lastAnalyzed]);
 
-  const result = state.result;
-  const analysis = result?.analysis
-    ? (result.analysis as AgentAnalysisWithStage1)
-    : null;
-  const opportunities = analysis?.opportunities ?? [];
-  const stage1Recommendations =
-    analysis?.compute_optimization?.recommendations ?? [];
+  const session = analysis.result;
+  const sessionRecommendations =
+    (session?.ok ? session.analysis?.compute_optimization?.recommendations : undefined) ?? [];
 
-  async function handleSendToApproval(recommendationId: string) {
-    setRequestingApproval((current) => ({
-      ...current,
-      [recommendationId]: true,
-    }));
+  const views: RecommendationView[] = useMemo(() => {
+    const persistedIds = new Set(lifecycle.views.map((v) => v.recommendation.recommendation_id));
+    const extra = sessionRecommendations
+      .filter((rec) => rec?.recommendation_id && !persistedIds.has(rec.recommendation_id))
+      .map((rec) => ({
+        recommendation: fromSession(rec),
+        approval: null,
+        lifecycle: lifecycleOf(rec.approval_status, rec.execution_status),
+      }));
+    return [...lifecycle.views, ...extra];
+  }, [lifecycle.views, sessionRecommendations]);
 
-    setApprovalErrors((current) => ({
-      ...current,
-      [recommendationId]: null,
-    }));
+  const counts = useMemo(() => {
+    const c: Record<Filter, number> = {
+      ALL: views.length,
+      OPEN: 0,
+      PENDING: 0,
+      REJECTED: 0,
+      READY_TO_EXECUTE: 0,
+      EXECUTING: 0,
+      EXECUTED: 0,
+      EXECUTION_FAILED: 0,
+    };
+    for (const v of views) c[v.lifecycle] += 1;
+    return c;
+  }, [views]);
 
+  const visible = filter === "ALL" ? views : views.filter((v) => v.lifecycle === filter);
+  const observations: AgentOpportunity[] = (session?.ok ? session.analysis?.opportunities : undefined) ?? [];
+  const limitations: string[] = (session?.ok ? session.analysis?.missing_evidence : undefined) ?? [];
+
+  // Scroll a linked recommendation into view once it is on screen.
+  useEffect(() => {
+    if (!highlight) return;
+    document.getElementById(`rec-${highlight}`)?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+  }, [highlight, views.length]);
+
+  async function send(recommendationId: string) {
+    setSending(recommendationId);
+    setNotice(null);
     try {
-      await requestStage1Approval(recommendationId);
-
-      setApprovalStates((current) => ({
-        ...current,
-        [recommendationId]: "PENDING",
-      }));
+      await requestApproval(recommendationId);
+      setNotice({ tone: "success", text: "Sent for approval. It now appears in Approvals as Pending." });
     } catch (e: unknown) {
-      setApprovalErrors((current) => ({
-        ...current,
-        [recommendationId]:
-          e instanceof Error
-            ? e.message
-            : "The approval request could not be created.",
-      }));
+      setNotice({
+        tone: "danger",
+        text: e instanceof RequestError ? e.message : "Could not send for approval.",
+        technical: e instanceof RequestError ? e.technical : null,
+      });
     } finally {
-      setRequestingApproval((current) => ({
-        ...current,
-        [recommendationId]: false,
-      }));
+      setSending(null);
+      // Always show what the backend now holds, success or not.
+      await lifecycle.reload();
     }
   }
+
+  function setFilter(next: Filter) {
+    const p = new URLSearchParams(params);
+    if (next === "ALL") p.delete("filter");
+    else p.set("filter", next);
+    setParams(p, { replace: true });
+  }
+
+  const nothing = !lifecycle.loading && views.length === 0 && observations.length === 0;
 
   return (
-    <Layout pageName="Recommendations" onRefresh={() => void load()}>
+    <Layout pageName="Recommendations" onRefresh={() => void lifecycle.reload()}>
       <div className="flex flex-col gap-6">
         <PageHeader
-          eyebrow="Databricks"
+          eyebrow="Compute Optimization"
           title="Recommendations"
-          description="What the discovered configuration suggests reviewing, and the evidence each one still needs. Read-only — nothing here changes a Databricks resource."
+          description="Evidence-backed recommendations from the Databricks compute analysis. Each one needs approval before it can move to Execution — approval never executes anything by itself."
           action={
-            <Button
-              icon={<Sparkles size={16} />}
-              variant="secondary"
-              onClick={() => navigate("/compute")}
-            >
-              View analysis
+            <Button icon={<Sparkles size={16} />} variant="secondary" onClick={() => navigate("/compute")}>
+              Compute analysis
             </Button>
           }
         />
+        <WorkflowIndicator current="recommendations" />
 
-        {error && (
-          <StatePanel
-            kind="error"
-            title="Analysis failed"
-            detail={error}
-          />
+        {session && !session.ok && (
+          <AnalysisFailure status={session.status} message={session.message} />
         )}
 
-        {loading && !analysis && (
-          <StatePanel
-            kind="loading"
-            title="Analyzing your Databricks compute…"
-          />
+        {notice && (
+          <Notice tone={notice.tone} testId="recommendation-notice">
+            {notice.text}
+            {notice.technical && <span className="mt-1 block font-mono text-[11px] opacity-80">{notice.technical}</span>}
+          </Notice>
         )}
 
-        {result && !result.ok && (
-          <StatePanel
-            kind="error"
-            title={result.status}
-            detail={
-              result.message ??
-              "The Databricks analysis could not be completed."
+        {lifecycle.error && (
+          <ErrorState
+            title="Could not load recommendations"
+            detail={lifecycle.error}
+            technical={lifecycle.technical}
+            action={
+              <Button variant="secondary" onClick={() => void lifecycle.reload()}>
+                Try again
+              </Button>
             }
           />
         )}
 
-        {analysis && (
-          <>
-            {state.analyzedAt && (
-              <p className="text-xs text-ink-faint">
-                Based on the compute analysis from{" "}
-                {state.analyzedAt.toLocaleTimeString()}
-                {analysis.workspace_name
-                  ? ` · ${analysis.workspace_name}`
-                  : ""}
+        {lifecycle.loading && views.length === 0 && <LoadingState title="Loading recommendations…" />}
+
+        {nothing && !lifecycle.error && (
+          <EmptyState
+            title="No recommendations"
+            detail={
+              session?.ok
+                ? "The latest analysis raised no recommendations — which is not a finding that the workspace is optimally configured."
+                : "No recommendations are available yet. Run a compute analysis to evaluate this Databricks environment."
+            }
+            action={
+              <Button icon={<Sparkles size={16} />} onClick={() => navigate("/compute")}>
+                Go to Compute analysis
+              </Button>
+            }
+          />
+        )}
+
+        {views.length > 0 && (
+          <section className="flex flex-col gap-4" aria-label="Compute recommendations">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <h2 className="text-sm font-semibold text-ink">Compute recommendations</h2>
+              <div role="tablist" aria-label="Filter by status" className="flex flex-wrap gap-1.5">
+                {FILTERS.map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    role="tab"
+                    aria-selected={filter === f}
+                    onClick={() => setFilter(f)}
+                    className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                      filter === f
+                        ? "border-brand-500 bg-brand-500 text-white"
+                        : "border-panel-border bg-panel text-ink-muted hover:text-ink"
+                    }`}
+                  >
+                    {f === "ALL" ? "All" : LIFECYCLE_LABELS[f]} <span className="tabular opacity-80">{counts[f]}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            {visible.length === 0 ? (
+              <p className="card px-5 py-8 text-center text-sm text-ink-muted">
+                No recommendations are {LIFECYCLE_LABELS[filter as Lifecycle]?.toLowerCase() ?? "in this view"}.
               </p>
+            ) : (
+              <ol className="flex flex-col gap-4">
+                {visible.map((view) => (
+                  <RecommendationCard
+                    key={view.recommendation.recommendation_id}
+                    view={view}
+                    highlighted={highlight === view.recommendation.recommendation_id}
+                    sending={sending === view.recommendation.recommendation_id}
+                    disabled={sending !== null}
+                    onSend={() => void send(view.recommendation.recommendation_id)}
+                  />
+                ))}
+              </ol>
             )}
+          </section>
+        )}
 
-            {stage1Recommendations.length > 0 && (
-              <section
-                className="flex flex-col gap-3"
-                aria-label="Stage 1 recommendations"
-              >
-                <h2 className="text-sm font-semibold text-ink">
-                  Stage 1 Recommendations
-                </h2>
+        {observations.length > 0 && (
+          <section className="flex flex-col gap-3" aria-label="Configuration observations">
+            <div>
+              <h2 className="text-sm font-semibold text-ink">Configuration Observations</h2>
+              <p className="mt-1 text-xs text-ink-muted">
+                From the configuration discovery in this session's analysis. Each states the evidence it needs before
+                anyone acts.
+              </p>
+            </div>
+            <ol className="flex flex-col gap-4">
+              {observations.map((item, index) => (
+                <ObservationItem key={`${item.resource_id}:${index}`} item={item} index={index + 1} />
+              ))}
+            </ol>
+          </section>
+        )}
 
-                <ol className="flex flex-col gap-4">
-                  {stage1Recommendations.map((recommendation) => (
-                    <Stage1RecommendationItem
-                      key={recommendation.recommendation_id}
-                      recommendation={recommendation}
-                      approvalState={
-                        approvalStates[recommendation.recommendation_id] ??
-                        getInitialApprovalState(recommendation.status)
-                      }
-                      requesting={
-                        requestingApproval[recommendation.recommendation_id] ??
-                        false
-                      }
-                      error={
-                        approvalErrors[recommendation.recommendation_id] ??
-                        null
-                      }
-                      onSendToApproval={() =>
-                        handleSendToApproval(
-                          recommendation.recommendation_id
-                        )
-                      }
-                    />
-                  ))}
-                </ol>
-              </section>
-            )}
-
-            {opportunities.length === 0 &&
-              stage1Recommendations.length === 0 && (
-                <StateBlock
-                  kind="empty"
-                  title="No recommendations"
-                  detail="Nothing in the visible configuration raised a question. Utilization, idle time and cost were not measured, so this is not a finding that the workspace is optimally configured."
-                />
-              )}
-
-            {opportunities.length > 0 && (
-              <section
-                className="flex flex-col gap-3"
-                aria-label="Configuration observations"
-              >
-                <h2 className="text-sm font-semibold text-ink">
-                  Configuration Observations
-                </h2>
-
-                <ol className="flex flex-col gap-4">
-                  {opportunities.map((item, index) => (
-                    <RecommendationItem
-                      key={`${item.resource_id}:${index}`}
-                      item={item}
-                      index={index + 1}
-                    />
-                  ))}
-                </ol>
-              </section>
-            )}
-
-            {analysis.missing_evidence.length > 0 && (
-              <section className="surface overflow-hidden">
-                <header className="px-5 py-4">
-                  <h2 className="text-sm font-semibold text-ink">
-                    Limitations
-                  </h2>
-                  <p className="mt-1 text-xs text-ink-faint">
-                    Discovery reads configuration, not behaviour. These were
-                    not observed.
-                  </p>
-                </header>
-
-                <ul className="border-t border-panel-border px-5 py-3">
-                  {analysis.missing_evidence.map((line) => (
-                    <li
-                      key={line}
-                      className="text-xs text-ink-muted"
-                    >
-                      • {line}
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
-          </>
+        {limitations.length > 0 && (
+          <section className="card overflow-hidden">
+            <header className="px-5 py-4">
+              <h2 className="text-sm font-semibold text-ink">Limitations</h2>
+              <p className="mt-1 text-xs text-ink-faint">Signals the configuration discovery step did not observe.</p>
+            </header>
+            <ul className="border-t border-panel-border px-5 py-3">
+              {limitations.map((line) => (
+                <li key={line} className="text-xs text-ink-muted">
+                  • {line}
+                </li>
+              ))}
+            </ul>
+          </section>
         )}
       </div>
     </Layout>
   );
 }
 
-function getInitialApprovalState(status: string): ApprovalUiState {
-  const normalized = status.trim().toUpperCase();
-
-  if (normalized === "APPROVED") return "APPROVED";
-  if (normalized === "REJECTED") return "REJECTED";
-  if (normalized === "PENDING") return "PENDING";
-
-  return "OPEN";
+function describeSavings(value: unknown): string {
+  const v = parseMaybeJson(value) as { status?: string; estimated?: unknown; measured?: unknown } | null;
+  if (v && typeof v === "object") {
+    if (typeof v.measured === "number") return `Measured: ${v.measured}`;
+    if (typeof v.estimated === "number") return `Estimated: ${v.estimated}`;
+  }
+  return "Not available. No savings estimate or measurement has been produced for this recommendation.";
 }
 
-function RecommendationItem({
-  item,
-  index,
-}: {
-  item: AgentOpportunity;
-  index: number;
-}) {
-  const rows: { label: string; value: string; mono?: boolean }[] = [
-    { label: "Finding", value: item.potential_issue },
-    {
-      label: "Observed evidence",
-      value: item.observed_evidence,
-      mono: true,
-    },
-    { label: "Recommendation", value: item.recommendation },
-    {
-      label: "Rationale",
-      value: `Raised because ${item.observed_evidence} was observed on this resource, which indicates: ${item.potential_issue}`,
-    },
-    {
-      label: "Evidence required before action",
-      value: item.evidence_required,
-    },
-    { label: "Expected impact", value: item.expected_impact },
-  ];
-
-  return (
-    <li className="surface overflow-hidden">
-      <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 px-5 py-4">
-        <div className="min-w-0">
-          <p className="text-sm font-medium text-ink">
-            {index}. {item.resource}
-          </p>
-
-          <p className="mt-0.5 text-xs text-ink-faint">
-            {TYPE_LABELS[item.resource_type] ?? item.resource_type}
-            {item.resource_id ? ` · ${item.resource_id}` : ""}
-          </p>
-        </div>
-
-        <StatusBadge
-          label="Potential Optimization Opportunity"
-          kind="status"
-          className="shrink-0"
-        />
-      </header>
-
-      <dl className="border-t border-panel-border px-5 py-3">
-        {rows.map((row) => (
-          <div
-            key={row.label}
-            className="flex flex-col gap-0.5 py-1 sm:flex-row sm:gap-3"
-          >
-            <dt className="shrink-0 text-xs text-ink-faint sm:w-56">
-              {row.label}
-            </dt>
-
-            <dd
-              className={`text-xs text-ink-muted ${
-                row.mono ? "font-mono" : ""
-              }`}
-            >
-              {row.value}
-            </dd>
-          </div>
-        ))}
-      </dl>
-    </li>
-  );
+function describeImpact(value: unknown): string | null {
+  const v = parseMaybeJson(value);
+  if (!v) return null;
+  if (typeof v === "string") return v;
+  if (typeof v === "object" && typeof (v as { description?: unknown }).description === "string") {
+    return (v as { description: string }).description;
+  }
+  return null;
 }
 
-function Stage1RecommendationItem({
-  recommendation,
-  approvalState,
-  requesting,
-  error,
-  onSendToApproval,
+function RecommendationCard({
+  view,
+  highlighted,
+  sending,
+  disabled,
+  onSend,
 }: {
-  recommendation: Stage1Recommendation;
-  approvalState: ApprovalUiState;
-  requesting: boolean;
-  error: string | null;
-  onSendToApproval: () => Promise<void>;
+  view: RecommendationView;
+  highlighted: boolean;
+  sending: boolean;
+  disabled: boolean;
+  onSend: () => void;
 }) {
   const navigate = useNavigate();
-  const proposedState = getProposedState(recommendation.proposed_state);
-
-  const expectedImpact =
-    recommendation.expected_impact &&
-    typeof recommendation.expected_impact === "object" &&
-    "description" in recommendation.expected_impact
-      ? formatValue(
-          (recommendation.expected_impact as { description?: unknown })
-            .description,
-        )
-      : formatValue(recommendation.expected_impact);
-
-  const rows: { label: string; value: string; mono?: boolean }[] = [
-    {
-      label: "Finding",
-      value: formatValue(recommendation.finding_type),
-    },
-    {
-      label: "Rule",
-      value: formatValue(recommendation.rule_id),
-      mono: true,
-    },
-    {
-      label: "Summary",
-      value: formatValue(recommendation.summary),
-    },
-    {
-      label: "Observed evidence",
-      value: formatValue(recommendation.evidence),
-      mono: true,
-    },
-    {
-      label: "Evidence reference",
-      value: formatValue(recommendation.evidence_references),
-      mono: true,
-    },
-    {
-      label: "Current state",
-      value: formatValue(recommendation.current_state),
-      mono: true,
-    },
-    {
-      label: "Proposed direction",
-      value: proposedState.direction,
-    },
-    {
-      label: "Direction rationale",
-      value: proposedState.reason,
-    },
-    {
-      label: "Expected impact",
-      value: expectedImpact,
-    },
-    {
-      label: "Evidence quality",
-      value: formatValue(recommendation.evidence_quality),
-      mono: true,
-    },
-    {
-      label: "Observation window",
-      value: `${recommendation.observation_window?.start ?? "Not available"} to ${
-        recommendation.observation_window?.end ?? "Not available"
-      }`,
-      mono: true,
-    },
-    {
-      label: "Confidence / severity / risk",
-      value: `${formatValue(recommendation.confidence)} / ${formatValue(
-        recommendation.severity,
-      )} / ${formatValue(recommendation.risk)}`,
-    },
-    {
-      label: "Savings",
-      value: "Not available. No savings estimate or measurement is provided.",
-    },
-  ];
-
-  const isPending = approvalState === "PENDING";
-  const isApproved = approvalState === "APPROVED";
-  const isRejected = approvalState === "REJECTED";
+  const { recommendation: r, approval, lifecycle } = view;
+  const d = r.details ?? {};
+  const proposed = parseMaybeJson(d.proposed_state) as { direction?: unknown; reason?: unknown } | string | null;
+  const direction =
+    proposed && typeof proposed === "object" ? proposed.direction : typeof proposed === "string" ? proposed : null;
+  const reason = proposed && typeof proposed === "object" ? proposed.reason : null;
+  const observed = parseMaybeJson(d.observation_window) as { start?: string | null; end?: string | null } | null;
+  const impact = describeImpact(d.expected_impact);
 
   return (
-    <li className="overflow-hidden rounded-2xl border border-red-100 bg-white shadow-sm">
-      <header className="flex flex-wrap items-start justify-between gap-4 border-b border-red-50 px-6 py-5">
+    <li
+      id={`rec-${r.recommendation_id}`}
+      data-testid="recommendation-card"
+      className={`card overflow-hidden ${highlighted ? "ring-2 ring-brand-300" : ""}`}
+    >
+      <header className="flex flex-wrap items-start justify-between gap-3 px-5 py-4">
         <div className="min-w-0">
-          <p className="text-base font-semibold text-ink">
-            {recommendation.title}
-          </p>
-          <p className="mt-1 text-xs text-ink-faint">
-            {recommendation.resource} · {recommendation.resource_id} ·{" "}
-            {recommendation.domain.replace(/_/g, " ")}
+          <p className="text-base font-semibold text-ink">{r.title ?? r.optimization_label ?? "Recommendation"}</p>
+          <p className="mt-1 text-xs text-ink-muted">
+            <span className="font-medium text-ink">{r.resource ?? d.resource_name ?? "Cluster"}</span>
+            {r.resource_id && r.resource_id !== r.resource && <span className="ml-1.5 font-mono">{r.resource_id}</span>}
+            {d.resource_type && <span className="ml-1.5">· {TYPE_LABELS[d.resource_type] ?? d.resource_type}</span>}
           </p>
         </div>
-
-        <StatusBadge
-          label={
-            isPending
-              ? "PENDING APPROVAL"
-              : isApproved
-                ? "APPROVED"
-                : isRejected
-                  ? "REJECTED"
-                  : "OPEN · REPORTING ONLY"
-          }
-          kind="status"
-          className="shrink-0"
-        />
+        <div className="flex flex-wrap gap-2">
+          {r.severity && <StatusPill tone={severityTone(r.severity)}>{titleCase(r.severity)} severity</StatusPill>}
+          {r.risk && <StatusPill tone="neutral">{titleCase(r.risk)} risk</StatusPill>}
+          <LifecyclePill lifecycle={lifecycle} />
+        </div>
       </header>
 
-      <p className="border-b border-panel-border px-6 py-4 text-sm leading-6 text-ink-muted">
-        {recommendation.description}
-      </p>
-
-      <dl className="px-6 py-4">
-        {rows.map((row) => (
-          <div
-            key={row.label}
-            className="flex flex-col gap-1 py-2 sm:flex-row sm:gap-4"
-          >
-            <dt className="shrink-0 text-xs font-medium text-ink-faint sm:w-56">
-              {row.label}
-            </dt>
-            <dd
-              className={`break-words text-xs leading-5 text-ink-muted ${
-                row.mono ? "font-mono" : ""
-              }`}
-            >
-              {row.value}
-            </dd>
+      <div className="grid gap-5 border-t border-panel-border px-5 py-4 lg:grid-cols-2">
+        <div className="flex flex-col gap-4">
+          {(r.description ?? d.summary) && <p className="text-sm text-ink">{r.description ?? d.summary}</p>}
+          <dl className="grid gap-3 text-xs">
+            <div>
+              <dt className="text-ink-faint">Recommended action</dt>
+              <dd className="mt-0.5 font-medium text-ink">{direction ? String(direction) : "Not available"}</dd>
+              {reason ? <dd className="mt-0.5 text-ink-muted">{String(reason)}</dd> : null}
+            </div>
+            {impact && (
+              <div>
+                <dt className="text-ink-faint">Expected impact</dt>
+                <dd className="mt-0.5 text-ink-muted">{impact}</dd>
+              </div>
+            )}
+            <div>
+              <dt className="text-ink-faint">Estimated savings</dt>
+              <dd className="mt-0.5 text-ink-muted">{describeSavings(d.estimated_savings)}</dd>
+            </div>
+            {r.rule_id && (
+              <div>
+                <dt className="text-ink-faint">Rule</dt>
+                <dd className="mt-0.5 font-mono text-ink-muted">{r.rule_id}</dd>
+              </div>
+            )}
+          </dl>
+        </div>
+        <div>
+          <p className="text-xs font-medium text-ink-faint">Evidence</p>
+          <div className="mt-2 rounded-sm border border-panel-border bg-canvas-raised p-3">
+            <KeyValueGrid data={parseMaybeJson(d.evidence)} empty="No evidence fields were recorded." />
           </div>
-        ))}
-      </dl>
-
-      {error && (
-        <div className="mx-6 mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          {error}
+          <p className="mt-2 text-[11px] text-ink-faint">
+            {observed?.start || observed?.end
+              ? `Observed ${formatDateTime(observed?.start)} – ${formatDateTime(observed?.end)} · `
+              : ""}
+            Created {formatDateTime(r.created_at)}
+          </p>
         </div>
-      )}
+      </div>
 
-      <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-red-50 bg-red-50/30 px-6 py-4">
-        <div className="flex items-center gap-2 text-xs text-ink-faint">
-          {isPending ? (
-            <>
-              <Clock3 size={15} />
-              Waiting for human approval
-            </>
-          ) : isApproved ? (
-            <>
-              <CheckCircle2 size={15} />
-              Approved — workflow stops here in the MVP
-            </>
-          ) : isRejected ? (
-            <>
-              <Clock3 size={15} />
-              Rejected — workflow stops here in the MVP
-            </>
-          ) : (
-            <>
-              <CheckCircle2 size={15} />
-              No Databricks resource has been changed
-            </>
-          )}
-        </div>
-
-        {isPending ? (
-          <button
-            type="button"
-            onClick={() => navigate("/approvals")}
-            className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-white px-4 py-2.5 text-sm font-semibold text-red-700 transition hover:border-red-300 hover:bg-red-50"
-          >
-            <Clock3 size={16} />
-            Open Approval Center
+      <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-panel-border bg-canvas-raised px-5 py-3">
+        <p className="text-xs text-ink-muted">
+          {lifecycle === "OPEN" && "Not yet sent for approval."}
+          {lifecycle === "PENDING" && `Waiting for a reviewer${approval?.created_at ? ` since ${formatDateTime(approval.created_at)}` : ""}.`}
+          {lifecycle === "READY_TO_EXECUTE" &&
+            `Approved${approval?.decided_by ? ` by ${approval.decided_by}` : ""}${
+              approval?.decided_at ? ` on ${formatDateTime(approval.decided_at)}` : ""
+            }. Ready to Execute.`}
+          {lifecycle === "REJECTED" &&
+            `Rejected${approval?.decided_by ? ` by ${approval.decided_by}` : ""}${
+              approval?.decided_at ? ` on ${formatDateTime(approval.decided_at)}` : ""
+            }.`}
+          {(lifecycle === "EXECUTING" || lifecycle === "EXECUTED" || lifecycle === "EXECUTION_FAILED") &&
+            `Execution status: ${LIFECYCLE_LABELS[lifecycle]}.`}
+        </p>
+        {(lifecycle === "OPEN" || lifecycle === "REJECTED") && (
+          <button type="button" className="btn-primary" onClick={onSend} disabled={disabled}>
+            <Send size={15} aria-hidden="true" />
+            {sending ? "Sending…" : lifecycle === "REJECTED" ? "Send to Approval again" : "Send to Approval"}
           </button>
-        ) : approvalState === "OPEN" ? (
-          <button
-            type="button"
-            onClick={() => void onSendToApproval()}
-            disabled={requesting}
-            className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <Send size={16} />
-            {requesting ? "Sending…" : "Send to Approval"}
+        )}
+        {lifecycle === "PENDING" && (
+          <button type="button" className="btn-secondary" onClick={() => navigate("/approvals?status=PENDING")}>
+            Open Approvals <ArrowRight size={15} aria-hidden="true" />
           </button>
-        ) : null}
+        )}
+        {(lifecycle === "READY_TO_EXECUTE" || lifecycle === "EXECUTING" || lifecycle === "EXECUTED" || lifecycle === "EXECUTION_FAILED") && (
+          <button type="button" className="btn-secondary" onClick={() => navigate("/execution")}>
+            Open Execution <ArrowRight size={15} aria-hidden="true" />
+          </button>
+        )}
       </footer>
     </li>
   );
 }
 
-// --- legacy multi-platform experience ---------------------------------------
+function ObservationItem({ item, index }: { item: AgentOpportunity; index: number }) {
+  const rows: { label: string; value: string; mono?: boolean }[] = [
+    { label: "Finding", value: item.potential_issue },
+    { label: "Observed evidence", value: item.observed_evidence, mono: true },
+    { label: "Recommendation", value: item.recommendation },
+    {
+      label: "Rationale",
+      value: `Raised because ${item.observed_evidence} was observed on this resource, which indicates: ${item.potential_issue}`,
+    },
+    { label: "Evidence required before action", value: item.evidence_required },
+    { label: "Expected impact", value: item.expected_impact },
+  ];
+
+  return (
+    <li className="card overflow-hidden">
+      <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 px-5 py-4">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-ink">
+            {index}. {item.resource}
+          </p>
+          <p className="mt-0.5 text-xs text-ink-faint">
+            {TYPE_LABELS[item.resource_type] ?? item.resource_type}
+            {item.resource_id ? ` · ${item.resource_id}` : ""}
+          </p>
+        </div>
+        <StatusPill tone="info">Potential Optimization Opportunity</StatusPill>
+      </header>
+      <dl className="border-t border-panel-border px-5 py-3">
+        {rows.map((row) => (
+          <div key={row.label} className="flex flex-col gap-0.5 py-1 sm:flex-row sm:gap-3">
+            <dt className="shrink-0 text-xs text-ink-faint sm:w-56">{row.label}</dt>
+            <dd className={`text-xs text-ink-muted ${row.mono ? "font-mono" : ""}`}>{row.value}</dd>
+          </div>
+        ))}
+      </dl>
+    </li>
+  );
+}
+
+// --- Legacy multi-platform experience (unchanged) ----------------------------
 
 function LegacyRecommendations() {
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);

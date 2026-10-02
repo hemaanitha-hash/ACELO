@@ -40,7 +40,7 @@ function RunIndicator() {
     <div className="relative" ref={ref}>
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 rounded-sm border border-[#D71920]/30 bg-[#D71920]/5 px-2.5 py-1.5 text-xs font-medium text-[#D71920]"
+        className="flex items-center gap-1.5 rounded-sm border border-brand-500/30 bg-brand-500/5 px-2.5 py-1.5 text-xs font-medium text-brand-500"
         aria-label={`${activeRuns.length} active run${activeRuns.length === 1 ? "" : "s"}`}
       >
         <Loader2 size={13} className="animate-spin" />
@@ -91,7 +91,7 @@ function NotificationBell() {
       >
         <Bell size={16} />
         {unread > 0 && (
-          <span className="absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#D71920] px-1 text-[10px] font-semibold text-white">
+          <span className="absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-500 px-1 text-[10px] font-semibold text-white">
             {unread > 9 ? "9+" : unread}
           </span>
         )}
@@ -101,7 +101,7 @@ function NotificationBell() {
           <div className="flex items-center justify-between border-b border-panel-border px-3 py-2">
             <p className="text-sm font-semibold text-ink">Notifications</p>
             {unread > 0 && (
-              <button onClick={() => void markAllRead()} className="text-xs text-[#D71920] hover:underline">
+              <button onClick={() => void markAllRead()} className="text-xs text-brand-500 hover:underline">
                 Mark all read
               </button>
             )}
@@ -118,7 +118,7 @@ function NotificationBell() {
                     setOpen(false);
                     if (n.link) navigate(n.link);
                   }}
-                  className={`block w-full px-3 py-2 text-left hover:bg-panel-hover ${n.read ? "" : "bg-[#D71920]/5"}`}
+                  className={`block w-full px-3 py-2 text-left hover:bg-panel-hover ${n.read ? "" : "bg-brand-500/5"}`}
                 >
                   <p className="text-sm font-medium text-ink">{n.title}</p>
                   {n.body && <p className="text-xs text-ink-muted">{n.body}</p>}
@@ -136,7 +136,7 @@ function NotificationBell() {
               ) : browserNotifications === "denied" ? (
                 <span>Browser notifications are blocked in your browser settings.</span>
               ) : (
-                <button onClick={() => void enableBrowserNotifications()} className="text-[#D71920] hover:underline">
+                <button onClick={() => void enableBrowserNotifications()} className="text-brand-500 hover:underline">
                   Enable browser notifications
                 </button>
               )}

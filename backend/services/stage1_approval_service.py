@@ -19,6 +19,7 @@ import json
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models import ApprovalRequest, AuditHistory, Customer, Recommendation
@@ -48,6 +49,11 @@ STAGE1_DOMAINS = {
     "autoscaling",
     "cluster",
 }
+
+
+def is_stage1_domain(domain: str | None) -> bool:
+    """Case-insensitive: recommendations are persisted as e.g. CLUSTER_SIZING."""
+    return (domain or "").strip().lower() in STAGE1_DOMAINS
 
 
 class Stage1ApprovalError(Exception):
@@ -261,7 +267,7 @@ def request_approval(
     )
 
     # Only Stage 1 recommendations may enter this workflow.
-    if rec.domain not in STAGE1_DOMAINS:
+    if not is_stage1_domain(rec.domain):
         raise Stage1ApprovalError(
             "Only Stage 1 Databricks recommendations can enter this approval flow.",
             422,
@@ -361,7 +367,7 @@ def list_approvals(
         )
         .filter(
             Recommendation.customer_id == customer.id,
-            Recommendation.domain.in_(STAGE1_DOMAINS),
+            func.lower(Recommendation.domain).in_(STAGE1_DOMAINS),
         )
     )
 

@@ -31,9 +31,16 @@ export interface ComputeAnalysisState {
   result: AgentAnalysisResult | null;
   /** When the stored result was produced, for "as of" labelling. */
   analyzedAt: Date | null;
+  /** True while an analysis request is in flight anywhere in the app. */
+  running?: boolean;
+  /** When the in-flight analysis was started. */
+  startedAt?: Date | null;
+  /** A request-level failure (no response at all), as opposed to ok=false. */
+  requestError?: string | null;
 }
 
 let current: ComputeAnalysisState = { result: null, analyzedAt: null };
+let inFlight: Promise<AgentAnalysisResult> | null = null;
 
 type Listener = (state: ComputeAnalysisState) => void;
 const listeners = new Set<Listener>();
@@ -61,15 +68,55 @@ export function subscribeComputeAnalysis(listener: Listener): () => void {
  */
 export async function ensureComputeAnalysis(prompt?: string): Promise<AgentAnalysisResult> {
   if (current.result) return current.result;
-  const result = await analyzeDatabricksCompute(
+  return runComputeAnalysis(prompt);
+}
+
+function publish(next: ComputeAnalysisState): void {
+  current = next;
+  for (const listener of listeners) listener(current);
+}
+
+/**
+ * Starts a Databricks compute analysis on explicit user request.
+ *
+ * With a registered cluster notebook each call starts a real Databricks run, so
+ * a second request while one is in flight joins the first instead of starting
+ * another run. Every page that offers "Analyze" goes through here.
+ */
+export function runComputeAnalysis(prompt?: string): Promise<AgentAnalysisResult> {
+  if (inFlight) return inFlight;
+  publish({ ...current, running: true, startedAt: new Date(), requestError: null });
+  inFlight = analyzeDatabricksCompute(
     prompt ?? "Analyze my Databricks compute and find optimization opportunities.",
-  );
-  setComputeAnalysis(result);
-  return result;
+  )
+    .then((result) => {
+      publish({ result, analyzedAt: new Date(), running: false, startedAt: null, requestError: null });
+      return result;
+    })
+    .catch((e: unknown) => {
+      // The previous result stays: a failed request must not erase what the
+      // user already had, and persisted recommendations are untouched.
+      publish({
+        ...current,
+        running: false,
+        startedAt: null,
+        requestError: e instanceof Error ? e.message : "The compute analysis could not be completed.",
+      });
+      throw e;
+    })
+    .finally(() => {
+      inFlight = null;
+    });
+  return inFlight;
+}
+
+export function isComputeAnalysisRunning(): boolean {
+  return inFlight !== null;
 }
 
 /** Test seam. */
 export function resetComputeAnalysis(): void {
+  inFlight = null;
   current = { result: null, analyzedAt: null };
   for (const listener of listeners) listener(current);
 }

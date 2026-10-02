@@ -26,7 +26,12 @@ import {
   ChevronDown,
   Check,
   X,
+  Cpu,
+  CircleDollarSign,
+  Workflow,
+  HardDrive,
 } from "lucide-react";
+import Logo from "./Logo";
 
 interface NavItem {
   to: string;
@@ -59,20 +64,41 @@ const sharedNavItems: NavItem[] = [
  * route itself refuses to load out of context (see App.tsx).
  */
 /**
- * The MVP journey, in order:
- *   Overview -> AI Agent -> Compute Optimization -> Recommendations
+ * The Databricks App navigation follows the ACELO lifecycle:
  *
- * Approvals, Execution and Run History remain implemented and routable; they
- * are simply not part of the primary Databricks compute-optimization journey,
- * so they are kept out of the main navigation rather than deleted.
+ *   Overview -> AI Agent -> Optimization -> Recommendations -> Approvals
+ *     -> Execution -> Run History
+ *
+ * Optimization is grouped by area. Compute is the active analysis; the other
+ * areas each have their own page stating their status in this environment.
  */
-const mvpNavItems: NavItem[] = [
+const mvpLeadItems: NavItem[] = [
   { to: "/", label: "Overview", icon: LayoutGrid, end: true },
   { to: "/agent", label: "AI Agent", icon: Sparkles },
-  { to: "/compute", label: "Compute Optimization", icon: Database },
+];
+
+const mvpOptimizationItems: NavItem[] = [
+  { to: "/compute", label: "Compute", icon: Cpu },
+  { to: "/optimization/cost", label: "Cost", icon: CircleDollarSign },
+  { to: "/optimization/jobs", label: "Jobs & Pipelines", icon: Workflow },
+  { to: "/optimization/sql", label: "SQL", icon: Database },
+  { to: "/optimization/storage", label: "Storage", icon: HardDrive },
+];
+
+const mvpLifecycleItems: NavItem[] = [
   { to: "/recommendations", label: "Recommendations", icon: FileText },
   { to: "/approvals", label: "Approvals", icon: ShieldCheck },
+  { to: "/execution", label: "Execution", icon: PlayCircle },
+  { to: "/history", label: "Run History", icon: History },
 ];
+
+function navClass({ isActive }: { isActive: boolean }) {
+  return `flex items-center justify-between rounded-sm border px-3 py-2 text-sm transition-colors ${
+    isActive
+      ? "border-brand-100 bg-brand-50 font-medium text-brand-700"
+      : "border-transparent text-ink-muted hover:bg-panel-hover hover:text-ink"
+  }`;
+}
 
 const platformNavItems: Record<ActivePlatformId, NavItem[]> = {
   // Databricks has its own discovery page. Fabric's resources are listed inside
@@ -125,8 +151,23 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
   const activePlatform = context.platform;
   const activeConnection = context.connection;
   const navItems: NavItem[] = databricksOnly
-    ? mvpNavItems
+    ? []
     : [...sharedNavItems, ...(activePlatform ? platformNavItems[activePlatform] : [])];
+  const runtime = getRuntime();
+
+  const renderItem = ({ to, label, icon: Icon, end, badge }: NavItem) => (
+    <NavLink key={to} to={to} end={end} onClick={onClose} className={navClass}>
+      <span className="flex items-center gap-2.5">
+        <Icon size={16} strokeWidth={1.75} />
+        {label}
+      </span>
+      {badge && (
+        <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-signal-medium px-1 text-[11px] font-semibold text-white">
+          {badge}
+        </span>
+      )}
+    </NavLink>
+  );
 
   return (
     <>
@@ -145,20 +186,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       >
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-5">
-          <div className="flex items-center gap-2.5">
-            <span className="flex h-8 w-8 items-center justify-center rounded-sm bg-brand-500/15 border border-brand-500/25">
-              <svg viewBox="0 0 32 32" className="h-4 w-4">
-                <path
-                  d="M16 6 L25 24 H20.5 L16 14.5 L11.5 24 H7 Z"
-                  fill="#C41E3A"
-                />
-              </svg>
-            </span>
-
-            <span className="text-[15px] font-semibold tracking-tight text-ink">
-              ACELO
-            </span>
-          </div>
+          <Logo caption="AI Optimization" />
 
           <button
             onClick={onClose}
@@ -175,16 +203,16 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         {databricksOnly && (
           <div className="mx-3 mb-4 rounded-sm border border-panel-border bg-panel px-3 py-2.5">
             <div className="flex items-center gap-2.5">
-              <Database size={15} className="shrink-0 text-ink-muted" />
+              <Database size={15} className="shrink-0 text-brand-500" />
               <div className="min-w-0">
                 <span className="block truncate text-sm font-medium leading-tight text-ink">
-                  Databricks
+                  ACELO Environment
                 </span>
                 <span
                   data-testid="workspace-context"
                   className="mt-0.5 block truncate text-xs leading-tight text-ink-faint"
                 >
-                  {getRuntime().workspace_host?.replace("https://", "") ??
+                  {runtime.workspace_host?.replace("https://", "") ??
                     "Current Databricks workspace"}
                 </span>
               </div>
@@ -284,51 +312,38 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         )}
 
         {/* Navigation */}
-        <nav className="flex-1 space-y-0.5 px-3">
-          {navItems.map(
-            ({ to, label, icon: Icon, end, badge }) => (
-              <NavLink
-                key={to}
-                to={to}
-                end={end}
-                onClick={onClose}
-                className={({ isActive }) =>
-                  `flex items-center justify-between rounded-sm px-3 py-2 text-sm transition-colors ${
-                    isActive
-                      ? "bg-brand-500/12 text-brand-300 border border-brand-500/20"
-                      : "text-ink-muted hover:bg-panel-hover hover:text-ink border border-transparent"
-                  }`
-                }
-              >
-                <span className="flex items-center gap-2.5">
-                  <Icon size={16} strokeWidth={1.75} />
-                  {label}
-                </span>
-
-                {badge && (
-                  <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-signal-medium px-1 text-[11px] font-semibold text-white">
-                    {badge}
-                  </span>
-                )}
-              </NavLink>
-            )
-          )}
-        </nav>
+        {databricksOnly ? (
+          <nav className="flex-1 space-y-0.5 overflow-y-auto px-3" aria-label="Main navigation">
+            {mvpLeadItems.map(renderItem)}
+            <p className="px-3 pb-1 pt-4 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
+              Optimization
+            </p>
+            <div className="space-y-0.5 border-l border-panel-border pl-2 ml-3">
+              {mvpOptimizationItems.map(renderItem)}
+            </div>
+            <p className="px-3 pb-1 pt-4 text-[11px] font-semibold uppercase tracking-wider text-ink-faint">
+              Lifecycle
+            </p>
+            {mvpLifecycleItems.map(renderItem)}
+          </nav>
+        ) : (
+          <nav className="flex-1 space-y-0.5 px-3">{navItems.map(renderItem)}</nav>
+        )}
 
         {/* Bottom Section */}
         <div className="mt-auto border-t border-panel-border px-3 py-4 space-y-0.5">
           <div className="flex items-center gap-2.5 rounded-sm px-3 py-2">
-            <span className="h-1.5 w-1.5 rounded-full bg-brand-400" />
+            <span className={`h-1.5 w-1.5 rounded-full ${databricksOnly ? "bg-signal-low" : "bg-brand-400"}`} />
 
             <div className="min-w-0">
               <p className="text-[11px] text-ink-faint leading-none">
-                {databricksOnly ? "Connection" : "Connected Platform"}
+                {databricksOnly ? "Databricks Environment" : "Connected Platform"}
               </p>
 
               <p className="text-sm text-ink leading-tight mt-0.5">
                 {databricksOnly
-                  ? getRuntime().databricks_app
-                    ? "Connected via Databricks App"
+                  ? runtime.databricks_app
+                    ? "Running as Databricks App"
                     : "Databricks"
                   : activePlatform
                     ? PLATFORM_LABELS[activePlatform]

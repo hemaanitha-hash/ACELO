@@ -14,6 +14,7 @@ import Settings from "./pages/Settings";
 import DatabricksDiscovery from "./pages/DatabricksDiscovery";
 import ComputeOptimization from "./pages/ComputeOptimization";
 import RunDetails from "./pages/RunDetails";
+import OptimizationArea from "./pages/OptimizationArea";
 import { RunMonitorProvider } from "./components/RunMonitor";
 import { isDatabricksOnly } from "./services/experience";
 import PlatformRoute from "./components/PlatformRoute";
@@ -28,6 +29,7 @@ export default function App() {
       {/* The MVP's main capability: discovery -> evidence -> analysis ->
           findings -> recommendations, in one place. */}
       <Route path="/compute" element={<ComputeOptimization />} />
+      <Route path="/optimization/:area" element={<OptimizationArea />} />
       <Route path="/optimizations" element={<Optimizations />} />
       <Route path="/optimizations/:id" element={<RecommendationDetail />} />
       <Route path="/recommendations" element={<Recommendations />} />

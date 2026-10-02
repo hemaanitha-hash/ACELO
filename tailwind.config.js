@@ -54,6 +54,7 @@ export default {
       boxShadow: {
         panel: "0 1px 0 0 rgba(255,255,255,0.02) inset",
         elevated: "0 8px 24px -12px rgba(0,0,0,0.55)",
+        card: "0 1px 2px 0 rgba(36,16,20,0.04), 0 1px 3px 0 rgba(36,16,20,0.03)",
       },
       fontSize: {
         display: ["2rem", { lineHeight: "1.15", letterSpacing: "-0.01em" }],

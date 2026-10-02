@@ -31,7 +31,7 @@ body {
 }
 
 :focus-visible {
-  outline: 2px solid #c41e3a;
+  outline: 2px solid theme('colors.brand.500');
   outline-offset: 2px;
   border-radius: 4px;
 }
@@ -43,6 +43,19 @@ body {
 @layer components {
   .surface {
     @apply bg-panel border border-panel-border rounded-lg;
+  }
+
+  /* The standard ACELO card: white surface, warm border, soft elevation. */
+  .card {
+    @apply bg-panel border border-panel-border rounded-lg shadow-card;
+  }
+
+  .card-interactive {
+    @apply transition-colors duration-150 hover:border-brand-300;
+  }
+
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 rounded-sm bg-brand-700 px-4 py-2 text-sm font-medium text-white transition-colors duration-150 hover:bg-brand-600 disabled:opacity-50 disabled:cursor-not-allowed;
   }
 
   .surface-interactive {

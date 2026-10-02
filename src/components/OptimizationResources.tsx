@@ -81,7 +81,7 @@ export default function OptimizationResources({
         users never enter tables, lakehouses or pipelines.
       </p>
 
-      {error && <p className="mt-3 text-sm text-[#D71920]">{error}</p>}
+      {error && <p className="mt-3 text-sm text-brand-500">{error}</p>}
       {!environmentId && <p className="mt-3 text-sm text-ink-muted">Save and test a connection first.</p>}
 
       {data && (
@@ -217,7 +217,7 @@ function DomainMapping({
               value={values[f.key] ?? ""}
               onChange={(e) => setValues({ ...values, [f.key]: e.target.value })}
               placeholder={(status.sources?.[f.key] === "config" && status.settings[f.key]) || f.hint || "Not configured"}
-              className="mt-1 w-full rounded-md border border-panel-border bg-white px-3 py-2 text-sm text-ink outline-none focus:border-[#D71920]"
+              className="mt-1 w-full rounded-md border border-panel-border bg-white px-3 py-2 text-sm text-ink outline-none focus:border-brand-500"
             />
           </label>
         ))}
@@ -226,13 +226,13 @@ function DomainMapping({
         type="button"
         onClick={() => void save()}
         disabled={busy}
-        className="mt-3 inline-flex items-center gap-2 rounded-md bg-[#D71920] px-4 py-2 text-sm font-medium text-white hover:bg-[#b5141a] disabled:opacity-50"
+        className="mt-3 inline-flex items-center gap-2 rounded-md bg-brand-500 px-4 py-2 text-sm font-medium text-white hover:bg-[#b5141a] disabled:opacity-50"
       >
         {busy && <Loader2 size={14} className="animate-spin" />}
         Save {TITLES[status.domain]} mapping
       </button>
       {message && (
-        <p className={`mt-2 text-xs ${message.ok ? "text-signal-low" : "text-[#D71920]"}`}>{message.text}</p>
+        <p className={`mt-2 text-xs ${message.ok ? "text-signal-low" : "text-brand-500"}`}>{message.text}</p>
       )}
     </fieldset>
   );

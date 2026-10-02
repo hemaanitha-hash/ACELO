@@ -3,6 +3,8 @@ import { useNavigate } from "react-router-dom";
 import Layout from "../components/Layout";
 import PageHeader from "../components/PageHeader";
 import { StatePanel } from "../components/StateBlock";
+import { ErrorState, WorkflowIndicator } from "../components/ui";
+import { isDatabricksOnly } from "../services/experience";
 import { ApiError } from "../services/environmentApi";
 import {
   RUN_STATES,
@@ -20,7 +22,7 @@ export function RunStateBadge({ state }: { state: RunState | string }) {
     state === "SUCCEEDED"
       ? "bg-signal-low/10 text-signal-low border-signal-low/25"
       : state === "FAILED"
-        ? "bg-[#D71920]/10 text-[#D71920] border-[#D71920]/25"
+        ? "bg-brand-500/10 text-brand-500 border-brand-500/25"
         : state === "CANCELLED"
           ? "bg-ink-faint/10 text-ink-muted border-panel-borderStrong"
           : "bg-signal-info/10 text-signal-info border-signal-info/25";
@@ -38,7 +40,7 @@ const OPTIMIZATIONS = [
   { value: "storage", label: "Storage Optimization" },
 ];
 const input =
-  "rounded-sm border border-panel-border bg-white px-2.5 py-1.5 text-sm text-ink focus:border-[#D71920] focus:outline-none";
+  "rounded-sm border border-panel-border bg-white px-2.5 py-1.5 text-sm text-ink focus:border-brand-500 focus:outline-none";
 
 export default function History() {
   const navigate = useNavigate();
@@ -78,12 +80,12 @@ export default function History() {
   return (
     <Layout pageName="Run History" onRefresh={() => void load()}>
       <div className="flex flex-col gap-6">
-        <div>
-          <h1 className="text-display font-semibold text-ink">Run history</h1>
-          <p className="mt-2 text-sm text-ink-muted">
-            Every optimization run ACELO has executed, with its platform run ID, status and outcome.
-          </p>
-        </div>
+        <PageHeader
+          eyebrow="Lifecycle"
+          title="Run History"
+          description="Every ACELO analysis run, with its Databricks run ID, status and outcome. Executions of approved recommendations are tracked in Execution."
+        />
+        {isDatabricksOnly() && <WorkflowIndicator current="history" />}
 
         <div className="surface flex flex-wrap items-end gap-3 p-4">
           <label className="flex min-w-[16rem] flex-1 flex-col gap-1 text-xs text-ink-muted">
@@ -128,7 +130,7 @@ export default function History() {
         </div>
 
         {error ? (
-          <div className="surface border-[#D71920]/30 px-4 py-6 text-sm text-[#D71920]">{error}</div>
+          <ErrorState title="Could not load run history" detail={error} />
         ) : loading && runs.length === 0 ? (
           <StatePanel kind="loading" title="Loading run history…" />
         ) : runs.length === 0 ? (
@@ -138,11 +140,12 @@ export default function History() {
             detail="Clear or widen the filters above to see more runs."
           />
         ) : (
-          <div className="surface overflow-x-auto">
+          <div className="card overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead className="border-b border-panel-border text-xs uppercase tracking-wide text-ink-faint">
                 <tr>
                   <th className="px-4 py-3">ACELO Run ID</th>
+                  <th className="px-4 py-3">Run type</th>
                   <th className="px-4 py-3">Optimization</th>
                   <th className="px-4 py-3">Platform</th>
                   <th className="px-4 py-3">Status</th>
@@ -163,7 +166,16 @@ export default function History() {
                     className="cursor-pointer border-b border-panel-border last:border-0 hover:bg-panel-hover"
                   >
                     <td className="px-4 py-3 font-mono text-xs text-ink-muted">{run.acelo_run_id}</td>
-                    <td className="px-4 py-3 font-medium text-ink">{run.optimization}</td>
+                    {/* /api/runs records analysis runs only (agent, file upload, re-run). */}
+                    <td className="px-4 py-3 text-ink-muted">Analysis run</td>
+                    <td className="px-4 py-3 font-medium text-ink">
+                      {run.optimization}
+                      {run.resource_id && (
+                        <span className="block max-w-[16rem] truncate font-mono text-[11px] font-normal text-ink-faint" title={run.resource_id}>
+                          {run.resource_id}
+                        </span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 capitalize text-ink-muted">{run.platform}</td>
                     <td className="px-4 py-3">
                       <RunStateBadge state={run.status} />

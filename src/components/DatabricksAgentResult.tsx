@@ -1,5 +1,6 @@
 import React from "react";
-import { AlertCircle, Check, Circle, Loader2, X } from "lucide-react";
+import { Check, Circle, Loader2, X } from "lucide-react";
+import { AnalysisFailure, AnalysisSummary } from "./AnalysisStatus";
 import type {
   AgentAnalysisResult,
   AgentAnalysisStep,
@@ -12,8 +13,9 @@ import type {
  * Every value shown here comes from the backend: the steps reflect work that
  * actually completed, and the opportunities carry the evidence they were
  * derived from. Nothing is animated on a timer and no figure is computed in
- * the browser — the backend deliberately states no cost or saving, because
- * discovery measures configuration, not consumption.
+ * the browser. When the Cluster Optimization notebook ran, its outcome (run id,
+ * findings, recommendations created) leads; the configuration observations
+ * from discovery follow.
  */
 
 const TYPE_LABELS: Record<string, string> = {
@@ -88,8 +90,11 @@ function Opportunity({ item, index }: { item: AgentOpportunity; index: number })
 export default function DatabricksAgentResult({
   result,
   running,
+  showOutcome = true,
 }: {
   result: AgentAnalysisResult | null;
+  /** False where the page already shows the outcome above this component. */
+  showOutcome?: boolean;
   /** True while the backend call is in flight, before any step has a verdict. */
   running?: boolean;
 }) {
@@ -118,15 +123,9 @@ export default function DatabricksAgentResult({
         </ol>
       </div>
 
-      {!result.ok && (
-        <div className="surface flex items-start gap-2 px-4 py-3 text-sm text-signal-high">
-          <AlertCircle size={15} className="mt-0.5 shrink-0" />
-          <span>
-            <strong className="font-medium">{result.status}</strong>
-            {result.message ? ` — ${result.message}` : ""}
-          </span>
-        </div>
-      )}
+      {showOutcome && !result.ok && <AnalysisFailure status={result.status} message={result.message} />}
+
+      {showOutcome && result.ok && <AnalysisSummary result={result} />}
 
       {analysis && (
         <>
@@ -171,32 +170,34 @@ export default function DatabricksAgentResult({
             )}
           </section>
 
-          <section className="surface overflow-hidden">
-            <header className="px-4 py-3">
-              <h3 className="text-sm font-semibold text-ink">Missing Evidence</h3>
-              <p className="mt-1 text-xs text-ink-faint">
-                Discovery reads configuration, not behaviour. These were not observed.
-              </p>
-            </header>
-            <ul className="border-t border-panel-border px-4 py-3">
-              {analysis.missing_evidence.map((item) => (
-                <li key={item} className="text-xs text-ink-muted">
-                  • {item}
-                </li>
-              ))}
-            </ul>
-          </section>
+          {analysis.missing_evidence.length > 0 && (
+            <section className="surface overflow-hidden">
+              <header className="px-4 py-3">
+                <h3 className="text-sm font-semibold text-ink">Evidence Limitations</h3>
+                <p className="mt-1 text-xs text-ink-faint">
+                  Signals the configuration discovery step did not observe.
+                </p>
+              </header>
+              <ul className="border-t border-panel-border px-4 py-3">
+                {analysis.missing_evidence.map((item) => (
+                  <li key={item} className="text-xs text-ink-muted">
+                    • {item}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
 
           <section className="surface overflow-hidden">
             <header className="px-4 py-3">
-              <h3 className="text-sm font-semibold text-ink">Potential Optimization Opportunities</h3>
+              <h3 className="text-sm font-semibold text-ink">Configuration Observations</h3>
               <p className="mt-1 text-xs text-ink-faint">
-                Raised from configuration. Each needs its listed evidence before anyone acts.
+                Raised from discovered configuration. Each lists the evidence it needs before anyone acts.
               </p>
             </header>
             {analysis.opportunities.length === 0 ? (
               <p className="border-t border-panel-border px-4 py-6 text-center text-sm text-ink-muted">
-                None raised — which is not a finding that the workspace is optimally configured.
+                No configuration observations were raised.
               </p>
             ) : (
               <ul>

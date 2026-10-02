@@ -215,7 +215,7 @@ export default function ApprovalDetail() {
             </section>
 
             {a.requires_new_approval && a.latest_recommendation && (
-              <section data-testid="new-recommendation" className="surface border-l-4 border-l-[#D71920] p-5">
+              <section data-testid="new-recommendation" className="surface border-l-4 border-l-brand-500 p-5">
                 <p className="text-sm font-semibold text-ink">A newer recommendation is available</p>
                 <p className="mt-1 text-sm text-ink-muted">
                   A later run produced a different recommendation for this cluster. The current{" "}

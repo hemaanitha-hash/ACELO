@@ -15,11 +15,16 @@ import {
 import { isDatabricksOnly } from "../services/experience";
 import {
   AgentApiError,
-  analyzeDatabricksCompute,
   isDatabricksComputeRequest,
   type AgentAnalysisResult,
 } from "../services/databricksAgentApi";
-import { setComputeAnalysis } from "../services/computeAnalysis";
+import {
+  getComputeAnalysis,
+  runComputeAnalysis,
+  subscribeComputeAnalysis,
+  type ComputeAnalysisState,
+} from "../services/computeAnalysis";
+import { AnalysisProgress } from "./AnalysisStatus";
 import Button from "./Button";
 import { useMsal } from "@azure/msal-react";
 import { ApiError } from "../services/environmentApi";
@@ -112,9 +117,14 @@ function AgentTarget() {
       className="mt-5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-sm border border-panel-border bg-canvas-raised px-3 py-2 text-sm"
     >
       <Database size={14} className="shrink-0 text-ink-muted" />
-      <span className="text-ink-muted">Analyzing</span>
+      <span className="text-ink-muted">{isDatabricksOnly() ? "ACELO Environment" : "Analyzing"}</span>
       <span className="font-medium text-ink">{PLATFORM_LABELS[context.platform]}</span>
-      {context.connection && (
+      {isDatabricksOnly() ? (
+        <>
+          <span className="text-ink-faint">·</span>
+          <span className="text-signal-low">Agent Ready</span>
+        </>
+      ) : context.connection && (
         <>
           <span className="text-ink-faint">·</span>
           <span className="truncate text-ink-muted">{context.connection.name}</span>
@@ -144,6 +154,9 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
   const poller = useRef<number | null>(null);
   // Whether the current run's environment uses delegated (Microsoft Account) auth.
   const delegated = useRef(false);
+  // The shared compute analysis: one in flight across the whole app.
+  const [analysisState, setAnalysisState] = useState<ComputeAnalysisState>(getComputeAnalysis());
+  useEffect(() => subscribeComputeAnalysis(setAnalysisState), []);
 
   // Unmount only stops this view polling; it never cancels the backend run.
   useEffect(() => {
@@ -152,9 +165,26 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
 
   useEffect(() => {
     if (initialPrompt) startRun(initialPrompt);
+    else if (getComputeAnalysis().running) void joinRunningAnalysis();
     else void restoreLastRun();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /**
+   * An analysis started elsewhere (e.g. Compute) is still in flight: follow it
+   * here instead of starting a second Databricks run.
+   */
+  async function joinRunningAnalysis() {
+    setPrompt("Analyze my Databricks compute");
+    setRunState("starting");
+    try {
+      setDatabricksResult(await runComputeAnalysis());
+      setRunState("done");
+    } catch (e: unknown) {
+      setRunState("error");
+      setError(e instanceof AgentApiError ? e.message : "The Databricks analysis could not be completed.");
+    }
+  }
 
   /** Coming back to the Agent: show the latest state of the run started here. */
   async function restoreLastRun() {
@@ -251,11 +281,10 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
     // so every existing prompt keeps its current behaviour.
     if (!file && isDatabricksComputeRequest(trimmed)) {
       try {
-        const analysis = await analyzeDatabricksCompute(trimmed);
+        // Through the shared runner: it records the result for the rest of the
+        // journey and never starts a second run while one is in flight.
+        const analysis = await runComputeAnalysis(trimmed);
         setDatabricksResult(analysis);
-        // The agent is also a producer of the journey's analysis, so a user who
-        // asks here and then opens Recommendations sees the same findings.
-        setComputeAnalysis(analysis);
         setRunState("done");
       } catch (e: unknown) {
         setRunState("error");
@@ -406,8 +435,9 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
                 How can I help optimize your Databricks environment?
               </h2>
               <p className="mt-1 text-sm text-ink-muted max-w-xl">
-                Describe what you want to analyze. Databricks is already the active platform,
-                so you never need to name it or pick a workspace.
+                ACELO is running inside your Databricks environment. Ask it to analyze compute and it
+                runs the Databricks optimization analysis, then turns the findings into recommendations
+                for your approval.
               </p>
             </div>
           </div>
@@ -551,10 +581,19 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
           {(databricksResult || (runState === "starting" && isDatabricksComputeRequest(prompt))) && (
             <div className="mt-6">
               <p className="label-eyebrow mb-4">Agent activity</p>
-              <DatabricksAgentResult
-                result={databricksResult}
-                running={runState === "starting"}
-              />
+              {runState === "starting" && !databricksResult ? (
+                <AnalysisProgress startedAt={analysisState.startedAt} />
+              ) : (
+                <DatabricksAgentResult result={databricksResult} running={false} />
+              )}
+              {databricksResult?.ok && (
+                <div className="mt-5 flex flex-wrap gap-2">
+                  <Button onClick={() => navigate("/recommendations")}>Review recommendations</Button>
+                  <Button variant="secondary" onClick={() => navigate("/history")}>
+                    Open Run History
+                  </Button>
+                </div>
+              )}
             </div>
           )}
 
@@ -603,7 +642,7 @@ export default function AgentWorkspace({ initialPrompt }: AgentWorkspaceProps) {
                           ACELO run: <span className="font-mono">{run.id}</span>{" "}
                           <button
                             onClick={() => navigate(`/runs/${run.id}`)}
-                            className="ml-1 text-[#D71920] hover:underline"
+                            className="ml-1 text-brand-500 hover:underline"
                           >
                             View run details
                           </button>

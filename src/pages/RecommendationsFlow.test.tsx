@@ -92,21 +92,39 @@ const STAGE1_RECOMMENDATION: Stage1Recommendation = {
   updated_at: "2026-09-01T02:01:00Z",
 };
 
-function mockAnalyze(body: unknown, ok = true, status = 200) {
-  const fetchMock = vi.fn().mockResolvedValue({
-    ok,
-    status,
-    json: async () => body,
-    text: async () => JSON.stringify(body),
+/**
+ * The analysis endpoint answers with `body`; the persisted-list endpoints
+ * (recommendations, approvals, runs) answer with `lists[path]` or an empty list,
+ * as the real backend does for a fresh environment.
+ */
+function mockAnalyze(body: unknown, ok = true, status = 200, lists: Record<string, unknown> = {}) {
+  const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+    const u = String(url);
+    const key = Object.keys(lists).find((k) => u.includes(k));
+    const payload = key
+      ? lists[key]
+      : u.includes("/optimizations") || u.includes("/approvals/recommendations")
+        ? []
+        : u.includes("/runs")
+          ? { total: 0, count: 0, runs: [] }
+          : body;
+    const good = key || !u.includes("/databricks/agent/analyze") ? true : ok;
+    return {
+      ok: good,
+      status: good ? 200 : status,
+      json: async () => payload,
+      text: async () => JSON.stringify(payload),
+    };
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
 
-/** Fails the test if the legacy optimizations endpoint is ever called. */
-function forbidLegacyEndpoint(fetchMock: ReturnType<typeof vi.fn>) {
+/** Recommendations come from the persisted Stage 1 list, never a fresh analysis. */
+function expectPersistedSource(fetchMock: ReturnType<typeof vi.fn>) {
   const called = fetchMock.mock.calls.map((c) => String(c[0]));
-  expect(called.some((url) => url.includes("/optimizations"))).toBe(false);
+  expect(called.some((url) => url.includes("/optimizations?domain=stage1"))).toBe(true);
+  expect(called.some((url) => url.includes("/databricks/agent/analyze"))).toBe(false);
 }
 
 function renderPage(ui: React.ReactElement) {
@@ -139,7 +157,7 @@ describe("Recommendations consumes the Databricks analysis", () => {
 
     renderPage(<Recommendations />);
 
-    expect(await screen.findByText("Stage 1 Recommendations")).toBeInTheDocument();
+    expect(await screen.findByText("Compute recommendations")).toBeInTheDocument();
     expect(screen.getByText("STAGE1.CLUSTER_SIZING.OVERSIZED")).toBeInTheDocument();
     expect(screen.getByText(/review_worker_capacity/)).toBeInTheDocument();
     expect(screen.getByText(/Potential reduction in excess worker capacity/)).toBeInTheDocument();
@@ -161,7 +179,7 @@ describe("Recommendations consumes the Databricks analysis", () => {
       .map((c) => String(c[0]))
       .filter((url) => url.includes("/databricks/agent/analyze"));
     expect(analyzeCalls).toHaveLength(0);
-    forbidLegacyEndpoint(fetchMock);
+    await waitFor(() => expectPersistedSource(fetchMock));
   });
 
   it("shows every evidence field the backend supplied", async () => {
@@ -207,22 +225,35 @@ describe("Recommendations consumes the Databricks analysis", () => {
     expect(text).not.toMatch(/\/month/);
   });
 
-  it("runs the same analysis when opened directly, not the legacy endpoint", async () => {
-    const fetchMock = mockAnalyze(ANALYSIS_RESULT);
-    // Nothing stored: a user deep-linked straight to Recommendations.
+  it("never starts an analysis when opened directly; it loads persisted recommendations", async () => {
+    const persisted = {
+      id: "stage1-rec-1",
+      recommendation_id: "stage1-rec-1",
+      kind: "stage1",
+      resource: "analytics",
+      resource_id: "cluster-1",
+      domain: "cluster",
+      title: "Review cluster capacity",
+      description: "Observed low utilization on this cluster.",
+      rule_id: "STAGE1.CLUSTER_SIZING.OVERSIZED",
+      severity: "MEDIUM",
+      risk: "MEDIUM",
+      created_at: "2026-09-01T02:01:00Z",
+      details: { ...STAGE1_RECOMMENDATION, approval_status: "NOT_REQUESTED" },
+    };
+    const fetchMock = mockAnalyze(ANALYSIS_RESULT, true, 200, { "/optimizations": [persisted] });
     expect(getComputeAnalysis().result).toBeNull();
 
     renderPage(<Recommendations />);
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    const called = fetchMock.mock.calls.map((c) => String(c[0]));
-    expect(called.some((url) => url.includes("/databricks/agent/analyze"))).toBe(true);
-    forbidLegacyEndpoint(fetchMock);
-    expect(await screen.findByText(/analytics-all-purpose/)).toBeInTheDocument();
+    expect(await screen.findByText("Review cluster capacity")).toBeInTheDocument();
+    expectPersistedSource(fetchMock);
+    expect(screen.getByRole("button", { name: /Send to Approval/ })).toBeInTheDocument();
   });
 
-  it("reports an analysis failure instead of showing stale or empty data", async () => {
-    mockAnalyze({
+  it("reports an analysis failure in plain language, with the status in the details", async () => {
+    mockAnalyze(ANALYSIS_RESULT);
+    setComputeAnalysis({
       ok: false,
       status: "AUTHENTICATION_FAILED",
       message: "Databricks authentication failed.",
@@ -234,7 +265,8 @@ describe("Recommendations consumes the Databricks analysis", () => {
 
     renderPage(<Recommendations />);
 
-    expect(await screen.findByText("AUTHENTICATION_FAILED")).toBeInTheDocument();
+    expect(await screen.findByText("Analysis could not be completed")).toBeInTheDocument();
+    expect(screen.getByText("AUTHENTICATION_FAILED")).toBeInTheDocument();
     expect(screen.getByText(/Databricks authentication failed/)).toBeInTheDocument();
     expect(screen.queryByText("Potential Optimization Opportunity")).not.toBeInTheDocument();
   });
@@ -258,9 +290,16 @@ describe("Recommendations consumes the Databricks analysis", () => {
 
 describe("Compute Optimization shares its result", () => {
   it("stores the analysis so Recommendations shows the same findings", async () => {
-    mockAnalyze(ANALYSIS_RESULT);
+    const fetchMock = mockAnalyze(ANALYSIS_RESULT, true, 200, {
+      "/connections": [{ id: "db-1", platform: "databricks", name: "workspace", status: "connected" }],
+    });
 
     renderPage(<ComputeOptimization />);
+
+    // Opening the page starts nothing; the user asks for the analysis.
+    await screen.findAllByRole("button", { name: /Analyze Compute/ });
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/databricks/agent/analyze"))).toBe(false);
+    (await screen.findAllByRole("button", { name: /Analyze Compute/ }))[0].click();
 
     await waitFor(() =>
       expect(getComputeAnalysis().result?.analysis?.opportunities).toHaveLength(1),

@@ -42,6 +42,7 @@ export default function Overview() {
   const navigate = useNavigate();
   const [data, setData] = useState<OverviewData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
   async function load() {
     setLoading(true);
     setData(await getOverview());
@@ -49,27 +50,17 @@ export default function Overview() {
   }
 
   useEffect(() => {
-    load();
+    // The Databricks Control Center loads its own data.
+    if (!isDatabricksOnly()) load();
   }, []);
 
   // The Databricks-only MVP shows the connected workspace and its compute,
   // not the legacy multi-platform cost dashboard.
   if (isDatabricksOnly()) {
+    // Refresh re-mounts the Control Center so every source is read again.
     return (
-      <Layout pageName="Overview" onRefresh={load}>
-        <div className="flex flex-col gap-6">
-          <PageHeader
-            eyebrow="Databricks"
-            title="Overview"
-            description="The Databricks workspace ACELO is running in, and the compute it can see."
-            action={
-              <Button icon={<Sparkles size={16} />} onClick={() => navigate("/agent")}>
-                Ask ACELO
-              </Button>
-            }
-          />
-          <DatabricksOverview />
-        </div>
+      <Layout pageName="Overview" onRefresh={() => setRefreshKey((k) => k + 1)}>
+        <DatabricksOverview key={refreshKey} />
       </Layout>
     );
   }
@@ -138,7 +129,7 @@ export default function Overview() {
                 <h2 className="text-sm font-semibold text-ink">Cluster optimization</h2>
                 <p className="mt-1 text-xs text-ink-muted">Latest recommendation per cluster · reporting only</p>
               </div>
-              <button onClick={() => navigate("/results")} className="text-xs text-[#D71920] hover:underline">
+              <button onClick={() => navigate("/results")} className="text-xs text-brand-500 hover:underline">
                 View results
               </button>
             </div>
@@ -168,7 +159,7 @@ export default function Overview() {
                 <h2 className="text-sm font-semibold text-ink">Query optimization</h2>
                 <p className="mt-1 text-xs text-ink-muted">Validated optimizations · approved in ACELO</p>
               </div>
-              <button onClick={() => navigate("/approvals")} className="text-xs text-[#D71920] hover:underline">
+              <button onClick={() => navigate("/approvals")} className="text-xs text-brand-500 hover:underline">
                 Open approvals
               </button>
             </div>
@@ -196,7 +187,7 @@ export default function Overview() {
                   type="button"
                   data-testid={`approval-kpi-${status}`}
                   onClick={() => navigate(`/approvals?status=${status}`)}
-                  className="rounded-sm border border-panel-border px-2 py-2 text-left hover:border-[#D71920]/40"
+                  className="rounded-sm border border-panel-border px-2 py-2 text-left hover:border-brand-500/40"
                 >
                   <span className="block text-[11px] text-ink-faint">{label}</span>
                   <span className="tabular text-base font-semibold text-ink">

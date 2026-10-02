@@ -94,20 +94,31 @@ describe("Databricks-only navigation", () => {
     );
   }
 
-  it("shows only the MVP journey", async () => {
+  it("shows the ACELO lifecycle navigation", async () => {
     renderSidebar();
 
-    for (const label of ["Overview", "AI Agent", "Compute Optimization", "Recommendations"]) {
+    for (const label of [
+      "Overview",
+      "AI Agent",
+      "Compute",
+      "Cost",
+      "Jobs & Pipelines",
+      "SQL",
+      "Storage",
+      "Recommendations",
+      "Approvals",
+      "Execution",
+      "Run History",
+    ]) {
       expect(await screen.findByRole("link", { name: new RegExp(label) })).toBeInTheDocument();
     }
   });
 
-  it("keeps non-MVP pages out of the primary journey", async () => {
+  it("keeps legacy multi-platform pages out of the navigation", async () => {
     renderSidebar();
     await screen.findByRole("link", { name: /Overview/ });
 
-    // Still routable and still implemented — just not in the MVP navigation.
-    for (const label of ["Approvals", "Execution", "Run History", "Optimizations"]) {
+    for (const label of ["Optimizations", "Compute discovery"]) {
       expect(screen.queryByRole("link", { name: new RegExp(`^${label}$`) })).not.toBeInTheDocument();
     }
   });
@@ -118,7 +129,7 @@ describe("Databricks-only navigation", () => {
     expect(await screen.findByTestId("workspace-context")).toHaveTextContent(
       "adb-7405617514546966.6.azuredatabricks.net",
     );
-    expect(screen.getByText("Connected via Databricks App")).toBeInTheDocument();
+    expect(screen.getByText("Running as Databricks App")).toBeInTheDocument();
     // No switcher: there is nothing to switch to.
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(screen.queryByText("Microsoft Fabric")).not.toBeInTheDocument();

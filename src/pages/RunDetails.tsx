@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMsal } from "@azure/msal-react";
 import Layout from "../components/Layout";
 import { RunStateBadge } from "./History";
+import { ErrorState, LoadingState } from "../components/ui";
 import { useRunMonitor } from "../components/RunMonitor";
 import { ApiError } from "../services/environmentApi";
 import { getFabricToken, getOneLakeToken, getSilentRunTokens } from "../services/fabricAuth";
@@ -31,7 +32,7 @@ function Field({ label, value, mono }: { label: string; value: React.ReactNode; 
 }
 
 function levelTone(level: string) {
-  if (level === "ERROR") return "text-[#D71920]";
+  if (level === "ERROR") return "text-brand-500";
   if (level === "WARNING") return "text-signal-medium";
   if (level === "SUCCESS") return "text-signal-low";
   return "text-ink-muted";
@@ -138,14 +139,22 @@ export default function RunDetails() {
   if (error && !run) {
     return (
       <Layout pageName="Run Details">
-        <div className="surface px-4 py-10 text-center text-sm text-[#D71920]">{error}</div>
+        <ErrorState
+          title="Could not load this run"
+          detail={error}
+          action={
+            <Link to="/history" className="btn-secondary">
+              Back to Run History
+            </Link>
+          }
+        />
       </Layout>
     );
   }
   if (!run) {
     return (
       <Layout pageName="Run Details">
-        <div className="surface py-16 text-center text-sm text-ink-muted">Loading run...</div>
+        <LoadingState title="Loading run…" />
       </Layout>
     );
   }
@@ -162,6 +171,7 @@ export default function RunDetails() {
             <Link to="/history" className="text-xs text-ink-muted hover:underline">
               ← Run history
             </Link>
+            <p className="label-eyebrow mt-3">Analysis run</p>
             <h1 className="mt-1 flex items-center gap-3 text-display font-semibold text-ink">
               {run.optimization} <RunStateBadge state={run.status} />
             </h1>
@@ -174,7 +184,7 @@ export default function RunDetails() {
               <button
                 disabled={busy}
                 onClick={() => void handleCancel()}
-                className="rounded-sm border border-[#D71920] px-3 py-2 text-sm font-medium text-[#D71920] hover:bg-[#D71920]/5 disabled:opacity-50"
+                className="rounded-sm border border-brand-500 px-3 py-2 text-sm font-medium text-brand-500 hover:bg-brand-500/5 disabled:opacity-50"
               >
                 Cancel run
               </button>
@@ -183,14 +193,14 @@ export default function RunDetails() {
               <button
                 disabled={busy}
                 onClick={() => void handleRerun()}
-                className="rounded-sm bg-[#D71920] px-3 py-2 text-sm font-medium text-white hover:bg-[#b5141a] disabled:opacity-50"
+                className="rounded-sm bg-brand-500 px-3 py-2 text-sm font-medium text-white hover:bg-brand-600 disabled:opacity-50"
               >
                 Re-run
               </button>
             )}
           </div>
         </div>
-        {actionError && <div className="surface px-4 py-3 text-sm text-[#D71920]">{actionError}</div>}
+        {actionError && <div className="surface px-4 py-3 text-sm text-brand-500">{actionError}</div>}
         {run.status === "CANCEL_REQUESTED" && (
           <div className="surface px-4 py-3 text-sm text-ink-muted">
             Cancellation was requested. The run is shown as cancelled only once the platform confirms it.
@@ -211,7 +221,7 @@ export default function RunDetails() {
               <Field
                 label="Re-run of"
                 value={
-                  <Link to={`/runs/${run.retry_of_run_id}`} className="font-mono text-xs text-[#D71920] hover:underline">
+                  <Link to={`/runs/${run.retry_of_run_id}`} className="font-mono text-xs text-brand-500 hover:underline">
                     {run.retry_of_run_id}
                   </Link>
                 }
@@ -221,7 +231,7 @@ export default function RunDetails() {
               <Field
                 label="Re-runs"
                 value={run.reruns.map((r) => (
-                  <Link key={r} to={`/runs/${r}`} className="block font-mono text-xs text-[#D71920] hover:underline">
+                  <Link key={r} to={`/runs/${r}`} className="block font-mono text-xs text-brand-500 hover:underline">
                     {r}
                   </Link>
                 ))}
@@ -231,7 +241,7 @@ export default function RunDetails() {
         </section>
 
         <section className="surface p-5">
-          <h2 className="mb-4 text-sm font-semibold text-ink">Platform execution</h2>
+          <h2 className="mb-4 text-sm font-semibold text-ink">{run.platform === "databricks" ? "Databricks run" : "Platform execution"}</h2>
           <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <Field label="Platform" value={<span className="capitalize">{run.platform}</span>} />
             <Field label="Execution type" value={run.execution_type} />
@@ -253,8 +263,8 @@ export default function RunDetails() {
         )}
 
         {(run.error_message || run.status === "FAILED") && (
-          <section className="surface border-[#D71920]/30 p-5">
-            <h2 className="mb-2 text-sm font-semibold text-[#D71920]">Error</h2>
+          <section className="surface border-brand-500/30 p-5">
+            <h2 className="mb-2 text-sm font-semibold text-brand-500">Error</h2>
             {run.error_code && <p className="font-mono text-xs text-ink-muted">{run.error_code}</p>}
             <p className="mt-1 whitespace-pre-wrap text-sm text-ink">{run.error_message ?? "No platform detail."}</p>
           </section>
@@ -268,7 +278,7 @@ export default function RunDetails() {
             <ol className="flex flex-col gap-3" aria-label="Run timeline">
               {timeline.map((e) => (
                 <li key={e.id} className="flex gap-3">
-                  <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${e.level === "ERROR" ? "bg-[#D71920]" : e.level === "SUCCESS" ? "bg-signal-low" : e.level === "WARNING" ? "bg-signal-medium" : "bg-ink-faint"}`} />
+                  <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${e.level === "ERROR" ? "bg-brand-500" : e.level === "SUCCESS" ? "bg-signal-low" : e.level === "WARNING" ? "bg-signal-medium" : "bg-ink-faint"}`} />
                   <div className="min-w-0">
                     <p className="text-sm text-ink">{e.message}</p>
                     <p className="text-[11px] text-ink-faint">
@@ -316,7 +326,7 @@ export default function RunDetails() {
               <p className="mb-3 text-xs text-ink-muted">
                 {run.result.row_count ?? rows.length} row(s)
                 {typeof run.result.table === "string" ? ` from ${run.result.table}` : ""}.{" "}
-                <Link to="/results" className="text-[#D71920] hover:underline">
+                <Link to="/results" className="text-brand-500 hover:underline">
                   Open in Results
                 </Link>
               </p>
@@ -375,7 +385,7 @@ function QueryRunResult({ result }: { result: NonNullable<Details["result"]> }) 
       <p className="mt-3 text-xs text-ink-muted">
         {typeof source.table === "string" ? `Read from ${source.table}. ` : ""}
         Validated optimizations are reviewed in the{" "}
-        <Link to="/approvals" className="text-[#D71920] hover:underline">
+        <Link to="/approvals" className="text-brand-500 hover:underline">
           Approval Center
         </Link>
         .

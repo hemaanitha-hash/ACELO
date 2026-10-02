@@ -6,6 +6,8 @@ import PageHeader from "../components/PageHeader";
 import { StatePanel } from "../components/StateBlock";
 import { ApiError } from "../services/environmentApi";
 import { display, listApprovals, usd, type Approval } from "../services/approvalsApi";
+import { isDatabricksOnly } from "../services/experience";
+import DatabricksExecution from "./DatabricksExecution";
 
 /**
  * Executions of APPROVED optimizations — real records only. An execution exists
@@ -13,6 +15,11 @@ import { display, listApprovals, usd, type Approval } from "../services/approval
  * approved-but-not-executed items are listed as ready so the step stays visible.
  */
 export default function Execution() {
+  if (isDatabricksOnly()) return <DatabricksExecution />;
+  return <LegacyExecution />;
+}
+
+function LegacyExecution() {
   const navigate = useNavigate();
   const [rows, setRows] = useState<Approval[]>([]);
   const [error, setError] = useState<string | null>(null);

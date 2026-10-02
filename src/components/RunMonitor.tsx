@@ -240,7 +240,7 @@ function RunToast({
   const kind = notification.type;
   const Icon = kind === "run_succeeded" ? CheckCircle2 : kind === "run_failed" ? XCircle : Ban;
   const tone =
-    kind === "run_succeeded" ? "text-signal-low" : kind === "run_failed" ? "text-[#D71920]" : "text-ink-muted";
+    kind === "run_succeeded" ? "text-signal-low" : kind === "run_failed" ? "text-brand-500" : "text-ink-muted";
   return (
     <div role="status" className="pointer-events-auto surface border border-panel-border bg-white p-4 shadow-lg">
       <div className="flex items-start gap-3">
@@ -255,7 +255,7 @@ function RunToast({
             {kind === "run_succeeded" && (
               <button
                 onClick={onViewResults}
-                className="rounded-sm bg-[#D71920] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#b5141a]"
+                className="rounded-sm bg-brand-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-[#b5141a]"
               >
                 View Results
               </button>

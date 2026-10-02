@@ -3,6 +3,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from error_handlers import add_exception_handlers
 from api import approvals, connections, databricks, environments, file_analysis, history, jobs, optimizations, overview, runs
@@ -107,7 +108,27 @@ def health():
 # `dist/` is present. In local development Vite serves the frontend instead and
 # this mount simply does not exist, so nothing about the dev workflow changes.
 _DIST = Path(__file__).resolve().parent.parent / "dist"
+
+
+class SPAStaticFiles(StaticFiles):
+    """
+    Serves real files from dist/ unchanged; a path that is not a file and not
+    under api/ returns index.html so the React router can handle it (direct
+    navigation / refresh on /recommendations, /approvals, ...). Unknown api/
+    paths keep their 404.
+    """
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            request_path = scope.get("path", "")
+            if exc.status_code != 404 or request_path == "/api" or request_path.startswith("/api/"):
+                raise
+            return await super().get_response("index.html", scope)
+
+
 if _DIST.is_dir():
-    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="frontend")
+    app.mount("/", SPAStaticFiles(directory=str(_DIST), html=True), name="frontend")
     logging.getLogger("acelo").info("serving_frontend_from path=%s", _DIST)
 
